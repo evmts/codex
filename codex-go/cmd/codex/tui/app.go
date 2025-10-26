@@ -80,7 +80,7 @@ func NewModel(mgr manager.ConversationManager) Model {
 
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, m.loadSessions())
+	return tea.Batch(textinput.Blink, m.loadSessions(), m.waitForEvent())
 }
 
 // Update handles messages and updates the model
@@ -102,6 +102,66 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessions = append(m.sessions, msg.sessionID)
 		m.selectedIdx = len(m.sessions) - 1
 		return m, nil
+
+	// Protocol event handlers
+	case taskStartedMsg:
+		// Clear streaming text for new response
+		m.streamingText = ""
+		return m, m.waitForEvent() // Continue polling
+
+	case textDeltaMsg:
+		// Append streaming text delta
+		m.streamingText += msg.delta
+		return m, m.waitForEvent() // Continue polling
+
+	case reasoningDeltaMsg:
+		// Could display reasoning in a separate area
+		// For now, just continue polling
+		return m, m.waitForEvent()
+
+	case tokenCountMsg:
+		// Update token display
+		m.totalTokens = msg.totalTokens
+		return m, m.waitForEvent() // Continue polling
+
+	case commandBeginMsg:
+		// Show tool execution started
+		// Could add to a command log
+		return m, m.waitForEvent()
+
+	case commandOutputMsg:
+		// Show command output
+		// Could append to command log
+		return m, m.waitForEvent()
+
+	case commandEndMsg:
+		// Show command completed
+		// Could display exit code and output
+		return m, m.waitForEvent()
+
+	case taskCompleteMsg:
+		// Task complete - finalize the message
+		finalText := m.streamingText
+		if finalText == "" && msg.finalMessage != "" {
+			finalText = msg.finalMessage
+		}
+		if finalText != "" {
+			m.messages = append(m.messages, Message{
+				Role:    "assistant",
+				Content: finalText,
+			})
+		}
+		m.streamingText = ""
+		// Re-enable input
+		m.inputText.Focus()
+		return m, m.waitForEvent() // Continue polling for next events
+
+	case errorEventMsg:
+		// Display error
+		m.err = fmt.Errorf("%s", msg.errorMsg)
+		m.streamingText = ""
+		m.inputText.Focus() // Re-enable input on error
+		return m, m.waitForEvent()
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -257,6 +317,17 @@ func (m *Model) createNewSession() tea.Cmd {
 		// Generate a new session ID
 		sessionID := fmt.Sprintf("session-%d", len(m.sessions)+1)
 
+		// Create event handler that sends events to the TUI's event channel
+		eventHandler := func(ctx context.Context, event *protocol.Event) error {
+			// Non-blocking send to avoid deadlocks
+			select {
+			case m.eventChan <- event:
+			default:
+				// Channel full, skip event (shouldn't happen with large buffer)
+			}
+			return nil
+		}
+
 		// Create session
 		ctx := context.Background()
 		_, err := m.conversationMgr.CreateSession(ctx, manager.SessionConfig{
@@ -268,6 +339,7 @@ func (m *Model) createNewSession() tea.Cmd {
 				SandboxPolicy:  protocol.SandboxPolicy{Mode: "native"},
 				Model:          m.model,
 			},
+			EventHandlers: []manager.EventHandler{eventHandler},
 		})
 
 		if err != nil {
@@ -309,6 +381,9 @@ func (m *Model) submitMessage() tea.Cmd {
 	m.inputText.SetValue("")
 	m.streamingText = ""
 
+	// Blur input while processing (will be re-focused on completion)
+	m.inputText.Blur()
+
 	return func() tea.Msg {
 		// Submit to conversation manager
 		ctx := context.Background()
@@ -327,8 +402,9 @@ func (m *Model) submitMessage() tea.Cmd {
 			return errorMsg{err: err}
 		}
 
-		// Simulate streaming (in real impl, listen to events)
-		return simulateStreaming("This is a simulated response.")
+		// Events will be received through the event channel
+		// and processed by waitForEvent() polling loop
+		return nil
 	}
 }
 
@@ -356,6 +432,53 @@ type sessionCreatedMsg struct {
 	sessionID string
 }
 
+// Protocol event messages
+type taskStartedMsg struct {
+	contextWindow int64
+}
+
+type textDeltaMsg struct {
+	delta        string
+	submissionID string
+}
+
+type reasoningDeltaMsg struct {
+	delta string
+}
+
+type tokenCountMsg struct {
+	inputTokens  int
+	outputTokens int
+	totalTokens  int
+}
+
+type commandBeginMsg struct {
+	callID   string
+	toolName string
+	command  []string
+}
+
+type commandOutputMsg struct {
+	callID string
+	output string
+	stream string // "stdout" or "stderr"
+}
+
+type commandEndMsg struct {
+	callID   string
+	exitCode int
+	output   string
+}
+
+type taskCompleteMsg struct {
+	finalMessage string
+}
+
+type errorEventMsg struct {
+	errorMsg string
+}
+
+// Legacy streaming messages (will be replaced by protocol events)
 type streamingMsg struct {
 	text string
 	done chan bool
@@ -380,6 +503,101 @@ func (m *Model) loadSessions() tea.Cmd {
 		sessions := m.conversationMgr.ListSessions()
 		return sessionsLoadedMsg{sessions: sessions}
 	}
+}
+
+// waitForEvent polls the event channel and converts protocol events to tea messages
+func (m *Model) waitForEvent() tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-m.eventChan
+		if !ok {
+			// Channel closed
+			return nil
+		}
+		return convertEventToMsg(event)
+	}
+}
+
+// convertEventToMsg converts a protocol.Event to a bubbletea message
+func convertEventToMsg(event *protocol.Event) tea.Msg {
+	if event == nil {
+		return nil
+	}
+
+	switch msg := event.Msg.(type) {
+	case *protocol.EventTaskStarted:
+		var contextWindow int64
+		if msg.ModelContextWindow != nil {
+			contextWindow = *msg.ModelContextWindow
+		}
+		return taskStartedMsg{contextWindow: contextWindow}
+
+	case *protocol.EventAgentMessageDelta:
+		return textDeltaMsg{
+			delta:        msg.Delta,
+			submissionID: event.ID,
+		}
+
+	case *protocol.EventAgentReasoningDelta:
+		return reasoningDeltaMsg{delta: msg.Delta}
+
+	case *protocol.EventTokenCount:
+		if msg.Info != nil {
+			return tokenCountMsg{
+				inputTokens:  int(msg.Info.TotalTokenUsage.InputTokens),
+				outputTokens: int(msg.Info.TotalTokenUsage.OutputTokens),
+				totalTokens:  int(msg.Info.TotalTokenUsage.TotalTokens),
+			}
+		}
+
+	case *protocol.EventExecCommandBegin:
+		// Extract tool name from command if available
+		toolName := "command"
+		if len(msg.Command) > 0 {
+			toolName = msg.Command[0]
+		}
+		return commandBeginMsg{
+			callID:   msg.CallID,
+			toolName: toolName,
+			command:  msg.Command,
+		}
+
+	case *protocol.EventExecCommandOutputDelta:
+		return commandOutputMsg{
+			callID: msg.CallID,
+			output: string(msg.Chunk),
+			stream: msg.Stream,
+		}
+
+	case *protocol.EventExecCommandEnd:
+		return commandEndMsg{
+			callID:   msg.CallID,
+			exitCode: msg.ExitCode,
+			output:   msg.AggregatedOutput,
+		}
+
+	case *protocol.EventToolCallApprovalNeeded:
+		// Convert to existing toolApprovalMsg
+		params := make(map[string]interface{})
+		params["command"] = msg.Command
+		params["working_directory"] = msg.WorkingDirectory
+		return toolApprovalMsg{
+			toolName:  msg.ToolName,
+			params:    params,
+			riskLevel: msg.RiskLevel,
+		}
+
+	case *protocol.EventTaskComplete:
+		finalMsg := ""
+		if msg.LastAgentMessage != nil {
+			finalMsg = *msg.LastAgentMessage
+		}
+		return taskCompleteMsg{finalMessage: finalMsg}
+
+	case *protocol.EventError:
+		return errorEventMsg{errorMsg: msg.Message}
+	}
+
+	return nil
 }
 
 func waitForStreaming(done chan bool) tea.Cmd {
