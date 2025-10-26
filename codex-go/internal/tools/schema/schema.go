@@ -39,9 +39,9 @@ func GenerateToolSchemas(registry *runtime.ToolRegistry) []client.Tool {
 			schema = generateReadFileSchema()
 		case "write_file":
 			schema = generateWriteFileSchema()
-		case "list_directory":
+		case "list_dir":
 			schema = generateListDirectorySchema()
-		case "grep":
+		case "grep_files":
 			schema = generateGrepSchema()
 		default:
 			// Skip unknown tools
@@ -196,7 +196,7 @@ func generateListDirectorySchema() *client.Tool {
 	return &client.Tool{
 		Type: "function",
 		Function: &client.FunctionDefinition{
-			Name:        "list_directory",
+			Name:        "list_dir",
 			Description: "List files and directories. Supports recursive listing and hidden files. Use this to explore directory structures, find files, understand project organization, etc.",
 			Parameters:  json.RawMessage(paramsJSON),
 		},
@@ -237,7 +237,7 @@ func generateGrepSchema() *client.Tool {
 	return &client.Tool{
 		Type: "function",
 		Function: &client.FunctionDefinition{
-			Name:        "grep",
+			Name:        "grep_files",
 			Description: "Search for text patterns in files using regular expressions. Supports recursive search and case-insensitive matching. Use this to find code patterns, search logs, locate string occurrences, etc.",
 			Parameters:  json.RawMessage(paramsJSON),
 		},
