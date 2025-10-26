@@ -66,16 +66,21 @@ func (h *SessionApprovalHandler) HandleApproval(ctx context.Context, req *runtim
 		}
 	}
 
-	// Create approval request tracking
-	approvalReq := &approvalRequest{
-		req:      req,
-		respChan: make(chan runtime.ApprovalDecision, 1),
-		errChan:  make(chan error, 1),
-	}
+    // Create approval request tracking
+    approvalReq := &approvalRequest{
+        req:      req,
+        respChan: make(chan runtime.ApprovalDecision, 1),
+        errChan:  make(chan error, 1),
+    }
 
-	h.mu.Lock()
-	h.pendingReqs[req.CallID] = approvalReq
-	h.mu.Unlock()
+    h.mu.Lock()
+    // Reject concurrent approval requests to avoid ambiguous state
+    if len(h.pendingReqs) > 0 {
+        h.mu.Unlock()
+        return runtime.ApprovalDenied, fmt.Errorf("another approval request is already pending")
+    }
+    h.pendingReqs[req.CallID] = approvalReq
+    h.mu.Unlock()
 
 	// Transition session to awaiting approval state
 	approvalType := ApprovalTypeExec

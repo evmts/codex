@@ -165,8 +165,15 @@ func (tp *TurnProcessor) processStream(ctx context.Context, submissionID string,
 		return nil
 	}
 
-	// Multi-turn loop: continue as long as the model requests tools
-	for len(result.toolCalls) > 0 {
+    // Multi-turn loop: continue as long as the model requests tools
+    // Add a safety guard to avoid infinite loops
+    const maxTurns = 10
+    turns := 0
+    for len(result.toolCalls) > 0 {
+        turns++
+        if turns > maxTurns {
+            return fmt.Errorf("maximum multi-turn iterations exceeded: %d", maxTurns)
+        }
 		// Build assistant message with tool calls to add to conversation
 		assistantMsg := client.Message{
 			Role:      "assistant",
