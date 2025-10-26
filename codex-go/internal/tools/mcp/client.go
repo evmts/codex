@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/evmts/codex/codex-go/internal/config"
+	"github.com/evmts/codex/codex-go/internal/tools/mcp/oauth"
 )
 
 // MCPClient defines the interface for MCP server communication.
@@ -34,6 +35,15 @@ type MCPClient interface {
 
 	// callTool executes a tool with the given arguments
 	callTool(ctx context.Context, name string, args map[string]interface{}) (string, error)
+
+	// listResources retrieves available resources from the MCP server
+	listResources(ctx context.Context) ([]MCPResource, error)
+
+	// readResource reads a resource by URI from the MCP server
+	readResource(ctx context.Context, uri string) (*MCPResourceContents, error)
+
+	// listResourceTemplates retrieves available resource templates from the MCP server
+	listResourceTemplates(ctx context.Context) ([]MCPResourceTemplate, error)
 
 	// close terminates the connection and cleans up resources
 	close() error
@@ -257,6 +267,166 @@ func (c *stdioClient) listTools(ctx context.Context) ([]MCPTool, error) {
 	return tools, nil
 }
 
+func (c *stdioClient) listResources(ctx context.Context) ([]MCPResource, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	req := jsonrpcRequest{
+		JSONRPC: "2.0",
+		ID:      c.nextID,
+		Method:  "resources/list",
+	}
+	c.nextID++
+
+	resp, err := c.sendRequestLocked(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list resources: %w", err)
+	}
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("MCP server error: %s", resp.Error.Message)
+	}
+
+	// Parse resources from response
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response format")
+	}
+
+	resourcesData, ok := result["resources"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid resources format")
+	}
+
+	resources := make([]MCPResource, 0, len(resourcesData))
+	for _, resourceData := range resourcesData {
+		resourceMap, ok := resourceData.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		resource := MCPResource{
+			URI:         getString(resourceMap, "uri"),
+			Name:        getString(resourceMap, "name"),
+			Description: getString(resourceMap, "description"),
+			MimeType:    getString(resourceMap, "mimeType"),
+		}
+
+		if annotations, ok := resourceMap["annotations"].(map[string]interface{}); ok {
+			resource.Annotations = annotations
+		}
+
+		resources = append(resources, resource)
+	}
+
+	return resources, nil
+}
+
+func (c *stdioClient) readResource(ctx context.Context, uri string) (*MCPResourceContents, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	req := jsonrpcRequest{
+		JSONRPC: "2.0",
+		ID:      c.nextID,
+		Method:  "resources/read",
+		Params: map[string]interface{}{
+			"uri": uri,
+		},
+	}
+	c.nextID++
+
+	resp, err := c.sendRequestLocked(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read resource: %w", err)
+	}
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("MCP server error: %s", resp.Error.Message)
+	}
+
+	// Parse resource contents from response
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response format")
+	}
+
+	contentsData, ok := result["contents"].([]interface{})
+	if !ok || len(contentsData) == 0 {
+		return nil, fmt.Errorf("invalid or empty contents format")
+	}
+
+	// Take the first content item
+	contentMap, ok := contentsData[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid content format")
+	}
+
+	contents := &MCPResourceContents{
+		URI:      getString(contentMap, "uri"),
+		MimeType: getString(contentMap, "mimeType"),
+		Text:     getString(contentMap, "text"),
+		Blob:     getString(contentMap, "blob"),
+	}
+
+	return contents, nil
+}
+
+func (c *stdioClient) listResourceTemplates(ctx context.Context) ([]MCPResourceTemplate, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	req := jsonrpcRequest{
+		JSONRPC: "2.0",
+		ID:      c.nextID,
+		Method:  "resources/templates/list",
+	}
+	c.nextID++
+
+	resp, err := c.sendRequestLocked(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list resource templates: %w", err)
+	}
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("MCP server error: %s", resp.Error.Message)
+	}
+
+	// Parse resource templates from response
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response format")
+	}
+
+	templatesData, ok := result["resourceTemplates"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid resource templates format")
+	}
+
+	templates := make([]MCPResourceTemplate, 0, len(templatesData))
+	for _, templateData := range templatesData {
+		templateMap, ok := templateData.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		template := MCPResourceTemplate{
+			URITemplate: getString(templateMap, "uriTemplate"),
+			Name:        getString(templateMap, "name"),
+			Description: getString(templateMap, "description"),
+			MimeType:    getString(templateMap, "mimeType"),
+		}
+
+		if annotations, ok := templateMap["annotations"].(map[string]interface{}); ok {
+			template.Annotations = annotations
+		}
+
+		templates = append(templates, template)
+	}
+
+	return templates, nil
+}
+
 func (c *stdioClient) callTool(ctx context.Context, name string, args map[string]interface{}) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -405,16 +575,31 @@ func (c *stdioClient) transportType() string {
 
 // httpClient implements MCPClient using HTTP transport
 type httpClient struct {
-	config     config.MCPServerConfig
-	httpClient *http.Client
-	mu         sync.Mutex
-	nextID     int
+	config       config.MCPServerConfig
+	httpClient   *http.Client
+	tokenManager *oauth.TokenManager
+	serverName   string
+	mu           sync.Mutex
+	nextID       int
 }
 
 // newHTTPClient creates a new HTTP-based MCP client
 func newHTTPClient(cfg config.MCPServerConfig) *httpClient {
 	return &httpClient{
 		config: cfg,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		nextID: 1,
+	}
+}
+
+// newHTTPClientWithOAuth creates a new HTTP-based MCP client with OAuth support
+func newHTTPClientWithOAuth(cfg config.MCPServerConfig, serverName string, tokenManager *oauth.TokenManager) *httpClient {
+	return &httpClient{
+		config:       cfg,
+		serverName:   serverName,
+		tokenManager: tokenManager,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -515,6 +700,166 @@ func (c *httpClient) listTools(ctx context.Context) ([]MCPTool, error) {
 	return tools, nil
 }
 
+func (c *httpClient) listResources(ctx context.Context) ([]MCPResource, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	req := jsonrpcRequest{
+		JSONRPC: "2.0",
+		ID:      c.nextID,
+		Method:  "resources/list",
+	}
+	c.nextID++
+
+	resp, err := c.sendRequestLocked(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list resources: %w", err)
+	}
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("MCP server error: %s", resp.Error.Message)
+	}
+
+	// Parse resources from response
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response format")
+	}
+
+	resourcesData, ok := result["resources"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid resources format")
+	}
+
+	resources := make([]MCPResource, 0, len(resourcesData))
+	for _, resourceData := range resourcesData {
+		resourceMap, ok := resourceData.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		resource := MCPResource{
+			URI:         getString(resourceMap, "uri"),
+			Name:        getString(resourceMap, "name"),
+			Description: getString(resourceMap, "description"),
+			MimeType:    getString(resourceMap, "mimeType"),
+		}
+
+		if annotations, ok := resourceMap["annotations"].(map[string]interface{}); ok {
+			resource.Annotations = annotations
+		}
+
+		resources = append(resources, resource)
+	}
+
+	return resources, nil
+}
+
+func (c *httpClient) readResource(ctx context.Context, uri string) (*MCPResourceContents, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	req := jsonrpcRequest{
+		JSONRPC: "2.0",
+		ID:      c.nextID,
+		Method:  "resources/read",
+		Params: map[string]interface{}{
+			"uri": uri,
+		},
+	}
+	c.nextID++
+
+	resp, err := c.sendRequestLocked(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read resource: %w", err)
+	}
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("MCP server error: %s", resp.Error.Message)
+	}
+
+	// Parse resource contents from response
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response format")
+	}
+
+	contentsData, ok := result["contents"].([]interface{})
+	if !ok || len(contentsData) == 0 {
+		return nil, fmt.Errorf("invalid or empty contents format")
+	}
+
+	// Take the first content item
+	contentMap, ok := contentsData[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid content format")
+	}
+
+	contents := &MCPResourceContents{
+		URI:      getString(contentMap, "uri"),
+		MimeType: getString(contentMap, "mimeType"),
+		Text:     getString(contentMap, "text"),
+		Blob:     getString(contentMap, "blob"),
+	}
+
+	return contents, nil
+}
+
+func (c *httpClient) listResourceTemplates(ctx context.Context) ([]MCPResourceTemplate, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	req := jsonrpcRequest{
+		JSONRPC: "2.0",
+		ID:      c.nextID,
+		Method:  "resources/templates/list",
+	}
+	c.nextID++
+
+	resp, err := c.sendRequestLocked(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list resource templates: %w", err)
+	}
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("MCP server error: %s", resp.Error.Message)
+	}
+
+	// Parse resource templates from response
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid response format")
+	}
+
+	templatesData, ok := result["resourceTemplates"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid resource templates format")
+	}
+
+	templates := make([]MCPResourceTemplate, 0, len(templatesData))
+	for _, templateData := range templatesData {
+		templateMap, ok := templateData.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		template := MCPResourceTemplate{
+			URITemplate: getString(templateMap, "uriTemplate"),
+			Name:        getString(templateMap, "name"),
+			Description: getString(templateMap, "description"),
+			MimeType:    getString(templateMap, "mimeType"),
+		}
+
+		if annotations, ok := templateMap["annotations"].(map[string]interface{}); ok {
+			template.Annotations = annotations
+		}
+
+		templates = append(templates, template)
+	}
+
+	return templates, nil
+}
+
 func (c *httpClient) callTool(ctx context.Context, name string, args map[string]interface{}) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -566,7 +911,19 @@ func (c *httpClient) sendRequestLocked(ctx context.Context, req jsonrpcRequest) 
 
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	// Add bearer token if configured
+	// Try OAuth token first if token manager is available
+	if c.tokenManager != nil && c.serverName != "" && c.config.URL != "" {
+		token, err := c.tokenManager.GetToken(c.serverName, c.config.URL)
+		if err == nil && token != nil {
+			// Inject OAuth token
+			if err := oauth.InjectOAuthHeader(httpReq, token); err != nil {
+				// Log warning but continue with request
+				// Token might be refreshed on next attempt
+			}
+		}
+	}
+
+	// Add bearer token if configured (fallback if OAuth not available)
 	if c.config.BearerTokenEnvVar != "" {
 		token := os.Getenv(c.config.BearerTokenEnvVar)
 		if token != "" {

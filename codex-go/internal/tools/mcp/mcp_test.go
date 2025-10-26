@@ -1017,6 +1017,18 @@ func (m *mockMCPClient) callTool(ctx context.Context, name string, args map[stri
 	return "", fmt.Errorf("tool not found: %s", name)
 }
 
+func (m *mockMCPClient) listResources(ctx context.Context) ([]MCPResource, error) {
+	return []MCPResource{}, nil
+}
+
+func (m *mockMCPClient) readResource(ctx context.Context, uri string) (*MCPResourceContents, error) {
+	return &MCPResourceContents{URI: uri}, nil
+}
+
+func (m *mockMCPClient) listResourceTemplates(ctx context.Context) ([]MCPResourceTemplate, error) {
+	return []MCPResourceTemplate{}, nil
+}
+
 func (m *mockMCPClient) close() error {
 	return nil
 }

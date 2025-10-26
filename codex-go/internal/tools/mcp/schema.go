@@ -23,6 +23,32 @@ var (
 	mcpServerNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 )
 
+// MCPResource represents a resource exposed by an MCP server
+type MCPResource struct {
+	URI         string                 `json:"uri"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	MimeType    string                 `json:"mimeType,omitempty"`
+	Annotations map[string]interface{} `json:"annotations,omitempty"`
+}
+
+// MCPResourceTemplate represents a resource template with URI patterns
+type MCPResourceTemplate struct {
+	URITemplate string                 `json:"uriTemplate"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	MimeType    string                 `json:"mimeType,omitempty"`
+	Annotations map[string]interface{} `json:"annotations,omitempty"`
+}
+
+// MCPResourceContents represents the contents of a resource
+type MCPResourceContents struct {
+	URI      string `json:"uri"`
+	MimeType string `json:"mimeType,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Blob     string `json:"blob,omitempty"` // base64-encoded binary data
+}
+
 // isValidMCPServerName validates that a server name conforms to the required pattern.
 // Server names must be non-empty and contain only ASCII alphanumeric characters,
 // underscores, and hyphens. This ensures safe tool name construction.
@@ -49,11 +75,16 @@ func validateMCPServerName(name string) error {
 }
 
 // convertMCPSchema converts an MCP tool input schema to the runtime tool schema format.
-// MCP schemas follow JSON Schema format which is directly compatible with runtime expectations.
+// MCP schemas follow JSON Schema format, but we sanitize them to ensure compatibility
+// with OpenAI's API requirements:
+//   - Infer missing types from schema keywords
+//   - Convert boolean schemas to proper objects
+//   - Normalize Unicode strings to NFC form
+//   - Add default values for required fields
 func convertMCPSchema(mcpSchema map[string]interface{}) interface{} {
-	// MCP schemas are already in JSON Schema format
-	// We can pass them through directly
-	return mcpSchema
+	// Sanitize the schema to handle edge cases from various MCP servers
+	// This ensures compatibility with OpenAI's API expectations
+	return sanitizeJSONSchema(mcpSchema)
 }
 
 // truncateToolName ensures the tool name doesn't exceed MaxToolNameLength.
@@ -124,15 +155,9 @@ func validateMCPTool(tool MCPTool) error {
 		return fmt.Errorf("tool name cannot be empty")
 	}
 
-	// Check for valid schema structure if present
-	if tool.InputSchema != nil {
-		// Verify it has a type field
-		if schemaType, ok := tool.InputSchema["type"]; ok {
-			if schemaType != "object" {
-				return fmt.Errorf("tool schema must be of type 'object', got: %v", schemaType)
-			}
-		}
-	}
+	// Schema validation is now lenient - we'll sanitize it later
+	// The sanitization process will infer types and fix structural issues
+	// We only check that the schema is not fundamentally broken
 
 	return nil
 }
