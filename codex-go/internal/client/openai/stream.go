@@ -71,8 +71,21 @@ type scanResult struct {
 }
 
 // parse reads and parses an SSE stream, emitting events to the channel.
+//
+// Note: The scanner goroutine cannot be interrupted mid-scan due to bufio.Scanner
+// limitations. In slow network conditions, cancellation may be delayed until the
+// next read completes. The underlying reader should have appropriate timeouts configured
+// to prevent indefinite blocking. For network streams, consider using http.Client with
+// appropriate timeouts (ReadTimeout, IdleConnTimeout) to ensure the scanner can be
+// interrupted in a reasonable time frame.
 func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- client.StreamEvent) error {
 	scanner := bufio.NewScanner(r)
+
+	// Increase buffer size to handle large chunks (e.g., large tool call arguments).
+	// Default bufio.Scanner buffer is 64KB, which is insufficient for large responses.
+	const maxScanTokenSize = 1024 * 1024 // 1MB
+	buf := make([]byte, maxScanTokenSize)
+	scanner.Buffer(buf, maxScanTokenSize)
 
 	// Configure idle timeout if set
 	var idleTimer *time.Timer
@@ -88,6 +101,13 @@ func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- cl
 
 	// Create a single goroutine for scanning that runs for the lifetime of this function.
 	// This prevents goroutine leaks that would occur if we created a new goroutine on each iteration.
+	//
+	// IMPORTANT: bufio.Scanner.Scan() is a blocking operation that cannot be interrupted
+	// mid-scan. The goroutine will only check for cancellation between scans. To ensure
+	// timely cancellation:
+	// 1. The underlying reader should have appropriate timeouts
+	// 2. For HTTP streams, configure client with ReadTimeout/IdleConnTimeout
+	// 3. Consider wrapping the reader with a context-aware reader that returns errors on ctx.Done()
 	scanCh := make(chan scanResult)
 	scanDone := make(chan struct{})
 	defer close(scanDone)
@@ -95,7 +115,22 @@ func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- cl
 	go func() {
 		defer close(scanCh) // Close channel when goroutine exits
 		for {
-			// Perform the blocking scan operation
+			// Check for cancellation before starting the blocking scan operation.
+			// This provides a fast path for cancellation when the scanner is between lines.
+			select {
+			case <-scanDone:
+				// Parse function returned, exit goroutine immediately
+				return
+			default:
+				// No cancellation yet, proceed with scan
+			}
+
+			// Perform the blocking scan operation.
+			// WARNING: This call cannot be interrupted! It will block until:
+			// - A complete line is read
+			// - EOF is reached
+			// - An error occurs
+			// - The underlying reader times out (if configured)
 			ok := scanner.Scan()
 			var line string
 			var err error

@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -18,6 +19,12 @@ type ConnectionPoolMetrics struct {
 	newConnections     atomic.Int64
 	poolExhaustions    atomic.Int64
 	connectionTimeouts atomic.Int64
+
+	// Resource leak tracking
+	openResponseBodies   atomic.Int64 // Currently open response bodies
+	totalResponseBodies  atomic.Int64 // Total response bodies created
+	closedResponseBodies atomic.Int64 // Total response bodies closed
+	leakedResponseBodies atomic.Int64 // Detected leaks (bodies not closed properly)
 
 	// Configuration thresholds
 	maxIdleConnsPerHost int
@@ -73,6 +80,33 @@ func (m *ConnectionPoolMetrics) TrackConnectionTimeout() {
 	m.logWarningThrottled("Connection timeout - check network latency or increase ConnectionTimeout")
 }
 
+// TrackResponseBodyOpened increments the open response body counter.
+// Call this when a response body is created.
+func (m *ConnectionPoolMetrics) TrackResponseBodyOpened() {
+	m.totalResponseBodies.Add(1)
+	m.openResponseBodies.Add(1)
+
+	// Check for potential leaks
+	open := m.openResponseBodies.Load()
+	if open > 100 {
+		m.logWarningThrottled("High number of open response bodies: %d - potential resource leak", open)
+	}
+}
+
+// TrackResponseBodyClosed decrements the open response body counter.
+// Call this when a response body is closed properly.
+func (m *ConnectionPoolMetrics) TrackResponseBodyClosed() {
+	m.closedResponseBodies.Add(1)
+	m.openResponseBodies.Add(-1)
+}
+
+// TrackResponseBodyLeak increments the leaked response body counter.
+// Call this when a leak is detected (e.g., body not closed before GC).
+func (m *ConnectionPoolMetrics) TrackResponseBodyLeak() {
+	m.leakedResponseBodies.Add(1)
+	m.logWarningThrottled("Response body leak detected - ensure all HTTP response bodies are closed")
+}
+
 // CheckPoolUtilization checks if the pool is approaching exhaustion and logs a warning.
 func (m *ConnectionPoolMetrics) CheckPoolUtilization(idle, active int) {
 	if m.maxIdleConnsPerHost <= 0 {
@@ -118,13 +152,19 @@ func (m *ConnectionPoolMetrics) GetStats() ConnectionPoolStats {
 		PoolExhaustions:    m.poolExhaustions.Load(),
 		ConnectionTimeouts: m.connectionTimeouts.Load(),
 		ReuseRate:          reuseRate,
+
+		// Resource leak tracking
+		OpenResponseBodies:   m.openResponseBodies.Load(),
+		TotalResponseBodies:  m.totalResponseBodies.Load(),
+		ClosedResponseBodies: m.closedResponseBodies.Load(),
+		LeakedResponseBodies: m.leakedResponseBodies.Load(),
 	}
 }
 
 // LogStats logs current connection pool statistics.
 func (m *ConnectionPoolMetrics) LogStats() {
 	stats := m.GetStats()
-	log.Printf("Connection pool stats: requests=%d active=%d idle=%d reuses=%d (%.1f%%) new=%d exhaustions=%d timeouts=%d",
+	log.Printf("Connection pool stats: requests=%d active=%d idle=%d reuses=%d (%.1f%%) new=%d exhaustions=%d timeouts=%d | response_bodies: open=%d total=%d closed=%d leaked=%d",
 		stats.TotalRequests,
 		stats.ActiveConnections,
 		stats.IdleConnections,
@@ -133,6 +173,10 @@ func (m *ConnectionPoolMetrics) LogStats() {
 		stats.NewConnections,
 		stats.PoolExhaustions,
 		stats.ConnectionTimeouts,
+		stats.OpenResponseBodies,
+		stats.TotalResponseBodies,
+		stats.ClosedResponseBodies,
+		stats.LeakedResponseBodies,
 	)
 }
 
@@ -160,6 +204,12 @@ type ConnectionPoolStats struct {
 	PoolExhaustions    int64   `json:"pool_exhaustions"`
 	ConnectionTimeouts int64   `json:"connection_timeouts"`
 	ReuseRate          float64 `json:"reuse_rate_percent"`
+
+	// Resource leak tracking
+	OpenResponseBodies   int64 `json:"open_response_bodies"`
+	TotalResponseBodies  int64 `json:"total_response_bodies"`
+	ClosedResponseBodies int64 `json:"closed_response_bodies"`
+	LeakedResponseBodies int64 `json:"leaked_response_bodies"`
 }
 
 // metricsTransport wraps http.RoundTripper to track connection metrics.
@@ -198,7 +248,32 @@ func (t *metricsTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		} else if elapsed > 100*time.Millisecond {
 			t.metrics.TrackNewConnection()
 		}
+
+		// Track response body creation
+		t.metrics.TrackResponseBodyOpened()
+
+		// Wrap the response body to track closure
+		resp.Body = &trackedReadCloser{
+			ReadCloser: resp.Body,
+			metrics:    t.metrics,
+		}
 	}
 
 	return resp, err
+}
+
+// trackedReadCloser wraps an io.ReadCloser to track when it's closed.
+type trackedReadCloser struct {
+	io.ReadCloser
+	metrics *ConnectionPoolMetrics
+	closed  atomic.Bool
+}
+
+// Close tracks the response body closure and delegates to the underlying closer.
+func (t *trackedReadCloser) Close() error {
+	// Use atomic CAS to ensure we only track closure once
+	if t.closed.CompareAndSwap(false, true) {
+		t.metrics.TrackResponseBodyClosed()
+	}
+	return t.ReadCloser.Close()
 }

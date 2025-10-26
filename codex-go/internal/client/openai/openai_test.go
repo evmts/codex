@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -1150,4 +1151,254 @@ func TestConcurrentRequestsWithTokenRefresh(t *testing.T) {
 
 	// Token refresh should have happened at least once
 	assert.Greater(t, refreshCount, 0, "token refresh should have been called")
+}
+
+// TestResponseBodyLeakOnTokenRefresh verifies that response bodies are properly closed
+// during token refresh scenarios to prevent resource leaks.
+func TestResponseBodyLeakOnTokenRefresh(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer old-token" {
+			// First request with old token - return 401
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":{"message":"Invalid token"}}`))
+			return
+		}
+		// Second request with new token - return success
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(client.ChatCompletionResponse{
+			ID:    "test-id",
+			Model: "gpt-4",
+			Choices: []client.Choice{
+				{
+					Index: 0,
+					Message: client.Message{
+						Role:    "assistant",
+						Content: "Success",
+					},
+					FinishReason: "stop",
+				},
+			},
+		})
+	}))
+	defer mockServer.Close()
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "old-token",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+		TokenRefreshFunc: func(ctx context.Context, oldToken string) (string, error) {
+			return "new-token", nil
+		},
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	// Get initial metrics
+	initialStats := c.GetConnectionPoolStats()
+	require.NotNil(t, initialStats, "metrics should be available")
+
+	ctx := test.ContextWithTimeout(t, 10*time.Second)
+	req := &client.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []client.Message{
+			client.NewUserMessage("Test"),
+		},
+	}
+
+	resp, err := c.Complete(ctx, req)
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+
+	// Get final metrics
+	finalStats := c.GetConnectionPoolStats()
+
+	// Verify that all response bodies were closed
+	// We expect: 1 failed request (401) + 1 successful request = 2 total bodies
+	assert.Equal(t, int64(2), finalStats.TotalResponseBodies, "should have 2 response bodies total")
+	assert.Equal(t, int64(2), finalStats.ClosedResponseBodies, "all response bodies should be closed")
+	assert.Equal(t, int64(0), finalStats.OpenResponseBodies, "no response bodies should remain open")
+	assert.Equal(t, int64(0), finalStats.LeakedResponseBodies, "no response bodies should be leaked")
+}
+
+// TestResponseBodyLeakOnStreamingTokenRefresh verifies that streaming response bodies
+// are properly closed during token refresh scenarios.
+func TestResponseBodyLeakOnStreamingTokenRefresh(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer old-token" {
+			// First request with old token - return 401
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":{"message":"Invalid token"}}`))
+			return
+		}
+		// Second request with new token - return streaming response
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok, "ResponseWriter should support flushing")
+
+		// Send streaming chunks
+		fmt.Fprintf(w, "data: %s\n\n", `{"id":"1","choices":[{"delta":{"role":"assistant"},"index":0}]}`)
+		flusher.Flush()
+
+		fmt.Fprintf(w, "data: %s\n\n", `{"id":"1","choices":[{"delta":{"content":"Hello"},"index":0}]}`)
+		flusher.Flush()
+
+		fmt.Fprintf(w, "data: %s\n\n", `{"id":"1","choices":[{"delta":{"content":" World"},"index":0,"finish_reason":"stop"}]}`)
+		flusher.Flush()
+
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer mockServer.Close()
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "old-token",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+		TokenRefreshFunc: func(ctx context.Context, oldToken string) (string, error) {
+			return "new-token", nil
+		},
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	// Get initial metrics
+	initialStats := c.GetConnectionPoolStats()
+	require.NotNil(t, initialStats, "metrics should be available")
+
+	ctx := test.ContextWithTimeout(t, 10*time.Second)
+	req := &client.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []client.Message{
+			client.NewUserMessage("Test"),
+		},
+	}
+
+	eventCh, err := c.Stream(ctx, req)
+	require.NoError(t, err)
+
+	// Consume all events
+	eventCount := 0
+	for event := range eventCh {
+		if event.Type == client.EventTypeError {
+			t.Fatalf("unexpected error event: %v", event.Error)
+		}
+		eventCount++
+	}
+
+	assert.Greater(t, eventCount, 0, "should receive events")
+
+	// Get final metrics
+	finalStats := c.GetConnectionPoolStats()
+
+	// Verify that all response bodies were closed
+	// We expect: 1 failed request (401) + 1 successful streaming request = 2 total bodies
+	assert.Equal(t, int64(2), finalStats.TotalResponseBodies, "should have 2 response bodies total")
+	assert.Equal(t, int64(2), finalStats.ClosedResponseBodies, "all response bodies should be closed")
+	assert.Equal(t, int64(0), finalStats.OpenResponseBodies, "no response bodies should remain open")
+	assert.Equal(t, int64(0), finalStats.LeakedResponseBodies, "no response bodies should be leaked")
+}
+
+// TestMultipleTokenRefreshesNoLeak verifies that multiple token refresh attempts
+// don't accumulate leaked response bodies.
+func TestMultipleTokenRefreshesNoLeak(t *testing.T) {
+	var requestMutex sync.Mutex
+	requestCount := 0
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestMutex.Lock()
+		requestCount++
+		currentCount := requestCount
+		requestMutex.Unlock()
+
+		auth := r.Header.Get("Authorization")
+
+		// Each "old-token-X" gets a 401, each "new-token-X" succeeds
+		if auth == "Bearer old-token-1" || auth == "Bearer old-token-2" || auth == "Bearer old-token-3" {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":{"message":"Invalid token"}}`))
+			return
+		}
+
+		// All other tokens succeed
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(client.ChatCompletionResponse{
+			ID:    fmt.Sprintf("test-id-%d", currentCount),
+			Model: "gpt-4",
+			Choices: []client.Choice{
+				{
+					Index: 0,
+					Message: client.Message{
+						Role:    "assistant",
+						Content: "Success",
+					},
+					FinishReason: "stop",
+				},
+			},
+		})
+	}))
+	defer mockServer.Close()
+
+	var refreshMutex sync.Mutex
+	refreshCount := 0
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "old-token-1",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+		TokenRefreshFunc: func(ctx context.Context, oldToken string) (string, error) {
+			refreshMutex.Lock()
+			refreshCount++
+			count := refreshCount
+			refreshMutex.Unlock()
+			return fmt.Sprintf("new-token-%d", count), nil
+		},
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	ctx := test.ContextWithTimeout(t, 10*time.Second)
+
+	// Make 3 requests, each will initially fail and trigger token refresh
+	for i := 0; i < 3; i++ {
+		// Reset token to old one to force refresh
+		c.updateToken(fmt.Sprintf("old-token-%d", i+1))
+
+		req := &client.ChatCompletionRequest{
+			Model: "gpt-4",
+			Messages: []client.Message{
+				client.NewUserMessage("Test"),
+			},
+		}
+
+		resp, err := c.Complete(ctx, req)
+		require.NoError(t, err)
+		assert.NotNil(t, resp)
+	}
+
+	// Get final metrics
+	finalStats := c.GetConnectionPoolStats()
+
+	// Verify no leaks
+	// Each iteration: 1 failed request (401) + 1 successful retry = 2 bodies
+	// Total: 3 iterations * 2 = 6 bodies
+	assert.Equal(t, int64(6), finalStats.TotalResponseBodies, "should have 6 response bodies total")
+	assert.Equal(t, finalStats.TotalResponseBodies, finalStats.ClosedResponseBodies,
+		"all response bodies should be closed")
+	assert.Equal(t, int64(0), finalStats.OpenResponseBodies, "no response bodies should remain open")
+	assert.Equal(t, int64(0), finalStats.LeakedResponseBodies, "no response bodies should be leaked")
+
+	// We should have had 3 refresh attempts
+	assert.Equal(t, 3, refreshCount, "token refresh should have been called 3 times")
 }

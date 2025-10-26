@@ -31,8 +31,8 @@ type Client struct {
 	modelInfoOnce         sync.Once
 
 	// Token refresh management
-	tokenMutex sync.RWMutex // Protects currentToken
-	currentToken string      // Current API token (synchronized for concurrent access)
+	tokenMutex   sync.RWMutex // Protects currentToken
+	currentToken string       // Current API token (synchronized for concurrent access)
 }
 
 // NewClient creates a new OpenAI client with the given configuration.
@@ -210,6 +210,12 @@ func (c *Client) completeWithRetry(ctx context.Context, req *client.ChatCompleti
 }
 
 // doComplete performs a single completion request without retry.
+//
+// Resource Management:
+// This function carefully manages HTTP response body lifecycle to prevent resource leaks.
+// Response bodies must be closed to release network connections back to the pool.
+// During token refresh, the first response body is explicitly closed before the retry
+// to avoid shadowing the deferred close statement. See RESOURCE_MANAGEMENT.md for details.
 func (c *Client) doComplete(ctx context.Context, req *client.ChatCompletionRequest) (*client.ChatCompletionResponse, int, error) {
 	// Build request
 	httpReq, err := c.buildRequest(ctx, req)
@@ -233,6 +239,11 @@ func (c *Client) doComplete(ctx context.Context, req *client.ChatCompletionReque
 		if readErr != nil {
 			return nil, httpResp.StatusCode, fmt.Errorf("failed to read error response body: %w", readErr)
 		}
+
+		// Explicitly close the first response body to prevent resource leak
+		// before making the retry request. This must be done before the retry
+		// because the deferred close at line 225 would be shadowed by a new defer.
+		httpResp.Body.Close()
 
 		// Attempt token refresh
 		oldToken := c.getToken()
@@ -352,6 +363,12 @@ func (c *Client) streamWithRetry(ctx context.Context, req *client.ChatCompletion
 }
 
 // doStream performs a single streaming request.
+//
+// Resource Management:
+// Like doComplete, this function manages HTTP response body lifecycle carefully.
+// During token refresh, the first response body is explicitly closed before retry.
+// The streaming parser manages its scanner goroutine lifecycle to prevent leaks.
+// See RESOURCE_MANAGEMENT.md for details on streaming resource management.
 func (c *Client) doStream(ctx context.Context, req *client.ChatCompletionRequest, eventCh chan<- client.StreamEvent) (error, int) {
 	// Build request
 	httpReq, err := c.buildRequest(ctx, req)
@@ -371,6 +388,17 @@ func (c *Client) doStream(ctx context.Context, req *client.ChatCompletionRequest
 
 	// Check for 401 Unauthorized and attempt token refresh if available
 	if httpResp.StatusCode == http.StatusUnauthorized && c.config.TokenRefreshFunc != nil {
+		// Read and drain the first response body before closing
+		_, readErr := io.ReadAll(httpResp.Body)
+		if readErr != nil {
+			return fmt.Errorf("failed to read error response body: %w", readErr), httpResp.StatusCode
+		}
+
+		// Explicitly close the first response body to prevent resource leak
+		// before making the retry request. This must be done before the retry
+		// because the deferred close at line 367 would be shadowed by a new defer.
+		httpResp.Body.Close()
+
 		// Attempt token refresh
 		oldToken := c.getToken()
 		newToken, refreshErr := c.config.TokenRefreshFunc(ctx, oldToken)
@@ -541,9 +569,9 @@ func newDefaultHTTPClientWithMetrics(timeout time.Duration, poolConfig client.Co
 		IdleConnTimeout:     poolConfig.IdleConnTimeout,
 
 		// Connection timeout settings
-		DisableKeepAlives:   false, // Enable connection reuse
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   poolConfig.EnableHTTP2,
+		DisableKeepAlives:  false, // Enable connection reuse
+		DisableCompression: false,
+		ForceAttemptHTTP2:  poolConfig.EnableHTTP2,
 
 		// Timeouts for establishing connections
 		TLSHandshakeTimeout:   poolConfig.ConnectionTimeout,
