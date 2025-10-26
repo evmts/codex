@@ -3,8 +3,9 @@ package manager
 import (
 	"context"
 	"fmt"
-	"path/filepath"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/evmts/codex/codex-go/internal/client"
@@ -26,6 +27,10 @@ type ConversationManager interface {
 
 	// GetSession retrieves an existing session by ID
 	GetSession(sessionID string) (*Session, error)
+
+	// AcquireSession retrieves a session and increments its reference count
+	// Caller MUST call session.Release() when done
+	AcquireSession(sessionID string) (*Session, error)
 
 	// ListSessions returns all active session IDs
 	ListSessions() []string
@@ -59,8 +64,11 @@ type manager struct {
 	sessionsRoot  string
 	enableHistory bool
 
-	// Optional history persistence interface (placeholder for future implementation)
-	// historyStore HistoryStore
+	// Goroutine lifecycle management
+	activeGoroutines int64 // Atomic counter for active goroutines across all sessions
+
+	// History persistence interface for session state management
+	historyStore HistoryStore
 }
 
 // ManagerConfig contains configuration for the conversation manager.
@@ -71,6 +79,8 @@ type ManagerConfig struct {
 	HistoryFs     afero.Fs
 	SessionsRoot  string
 	EnableHistory bool
+	// History storage backend (optional, defaults to FilesystemHistoryStore if history enabled)
+	HistoryStore HistoryStore
 	// Notification settings
 	NotifyConfig *config.NotifyConfig
 }
@@ -87,6 +97,22 @@ func NewManager(cfg ManagerConfig) (ConversationManager, error) {
 		notifier = notify.NewNotifier(convertNotifyConfig(cfg.NotifyConfig))
 	}
 
+	// Initialize history store if history is enabled
+	var historyStore HistoryStore
+	if cfg.EnableHistory {
+		if cfg.HistoryStore != nil {
+			// Use provided history store
+			historyStore = cfg.HistoryStore
+		} else if cfg.HistoryFs != nil && cfg.SessionsRoot != "" {
+			// Default to filesystem history store
+			store, err := NewFilesystemHistoryStore(cfg.HistoryFs, cfg.SessionsRoot)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create history store: %w", err)
+			}
+			historyStore = store
+		}
+	}
+
 	return &manager{
 		sessions:      make(map[string]*Session),
 		client:        cfg.Client,
@@ -95,6 +121,7 @@ func NewManager(cfg ManagerConfig) (ConversationManager, error) {
 		historyFs:     cfg.HistoryFs,
 		sessionsRoot:  cfg.SessionsRoot,
 		enableHistory: cfg.EnableHistory,
+		historyStore:  historyStore,
 	}, nil
 }
 
@@ -102,6 +129,13 @@ func NewManager(cfg ManagerConfig) (ConversationManager, error) {
 func (m *manager) CreateSession(ctx context.Context, cfg SessionConfig) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// SECURITY: Validate session ID to prevent path traversal attacks
+	if err := ValidateSessionID(cfg.ID); err != nil {
+		// Log security violation
+		log.Printf("SECURITY WARNING: Invalid session ID rejected: %v", err)
+		return nil, fmt.Errorf("invalid session ID: %w", err)
+	}
 
 	// Check if session already exists
 	if _, exists := m.sessions[cfg.ID]; exists {
@@ -120,7 +154,15 @@ func (m *manager) CreateSession(ctx context.Context, cfg SessionConfig) (*Sessio
 
 	// Set up history if enabled
 	if m.enableHistory && m.historyFs != nil && m.sessionsRoot != "" {
-		sessionDir := filepath.Join(m.sessionsRoot, cfg.ID)
+		// SECURITY: Use validated path construction to prevent directory traversal
+		sessionDir, err := ValidateAndResolveSessionPath(cfg.ID, m.sessionsRoot)
+		if err != nil {
+			// Log security violation
+			log.Printf("SECURITY WARNING: Session path validation failed for ID %q: %v",
+				sanitizeSessionIDForLog(cfg.ID), err)
+			return nil, fmt.Errorf("failed to resolve session path: %w", err)
+		}
+
 		hp, err := persistence.NewHistoryPersistence(m.historyFs, sessionDir)
 		if err != nil {
 			return nil, fmt.Errorf("failed to set up history persistence: %w", err)
@@ -144,10 +186,23 @@ func (m *manager) CreateSession(ctx context.Context, cfg SessionConfig) (*Sessio
 		_ = err
 	}
 
+	// Save initial session state if history store is available
+	if m.historyStore != nil {
+		state := session.ExtractState()
+		if err := m.historyStore.SaveSession(ctx, state); err != nil {
+			// Log error but don't fail session creation
+			// The session is still usable even if state save fails
+			log.Printf("WARNING: Failed to save initial session state for %s: %v", cfg.ID, err)
+		}
+	}
+
 	return session, nil
 }
 
 // GetSession retrieves an existing session by ID.
+// Note: This method does NOT increment the reference count.
+// For operations that need to use the session beyond the current call,
+// use AcquireSession instead.
 func (m *manager) GetSession(sessionID string) (*Session, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -155,6 +210,30 @@ func (m *manager) GetSession(sessionID string) (*Session, error) {
 	session, exists := m.sessions[sessionID]
 	if !exists {
 		return nil, fmt.Errorf("session %s not found", sessionID)
+	}
+
+	return session, nil
+}
+
+// AcquireSession retrieves a session and increments its reference count.
+// This prevents the session from being deleted while in use.
+// The caller MUST call session.Release() when done to prevent leaks.
+// Returns an error if the session doesn't exist or is closing.
+//
+// Thread-Safety: This method is safe for concurrent use and prevents
+// the TOCTOU race condition between GetSession and CloseSession.
+func (m *manager) AcquireSession(sessionID string) (*Session, error) {
+	m.mu.RLock()
+	session, exists := m.sessions[sessionID]
+	m.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("session %s not found", sessionID)
+	}
+
+	// Acquire reference - this may fail if session is closing
+	if err := session.Acquire(); err != nil {
+		return nil, err
 	}
 
 	return session, nil
@@ -174,30 +253,40 @@ func (m *manager) ListSessions() []string {
 }
 
 // CloseSession closes a session and removes it from the manager.
+// This method waits for all active operations on the session to complete
+// before removing it, preventing use-after-free races.
+//
+// Thread-Safety: Safe for concurrent use. Will block until all operations
+// using the session have called Release().
 func (m *manager) CloseSession(sessionID string) error {
+	// First, remove the session from the map so no new operations can find it
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	session, exists := m.sessions[sessionID]
 	if !exists {
+		m.mu.Unlock()
 		return fmt.Errorf("session %s not found", sessionID)
 	}
 
-	// Close the session
+	// Remove from manager immediately to prevent new operations
+	delete(m.sessions, sessionID)
+	m.mu.Unlock()
+
+	// Now close the session - this will wait for active operations to complete
+	// This happens outside the manager lock to avoid deadlocks
 	if err := session.Close(); err != nil {
 		return fmt.Errorf("failed to close session: %w", err)
 	}
-
-	// Remove from manager
-	delete(m.sessions, sessionID)
 
 	return nil
 }
 
 // SubmitOp submits an operation to a session for processing.
+// Thread-Safety: This method uses reference counting to prevent race conditions
+// with CloseSession. The session reference is held during the entire operation.
 func (m *manager) SubmitOp(ctx context.Context, sessionID string, op protocol.Op) error {
-	// Get the session
-	session, err := m.GetSession(sessionID)
+	// Acquire the session with reference counting
+	// This prevents the session from being deleted while we're using it
+	session, err := m.AcquireSession(sessionID)
 	if err != nil {
 		return err
 	}
@@ -221,42 +310,110 @@ func (m *manager) SubmitOp(ctx context.Context, sessionID string, op protocol.Op
 		return m.handleUserTurn(ctx, session, o)
 
 	case *protocol.OpInterrupt:
+		defer session.Release()
 		return m.handleInterrupt(ctx, session, o)
 
 	case *protocol.OpExecApproval:
+		defer session.Release()
 		return m.handleExecApproval(ctx, session, o)
 
 	case *protocol.OpPatchApproval:
+		defer session.Release()
 		return m.handlePatchApproval(ctx, session, o)
 
 	case *protocol.OpOverrideTurnContext:
+		defer session.Release()
 		return m.handleOverrideTurnContext(ctx, session, o)
 
 	default:
+		session.Release()
 		return fmt.Errorf("unsupported operation type: %s", op.OpType())
 	}
 }
 
 // handleUserTurn processes a user turn submission.
+//
+// Goroutine Lifecycle:
+// This function spawns a background goroutine to process the turn asynchronously.
+// The goroutine lifecycle is carefully managed to prevent leaks:
+//
+// 1. Reference Counting: The session reference (acquired in SubmitOp) is transferred
+//    to the goroutine, which releases it when done via defer.
+//
+// 2. Panic Recovery: The goroutine includes panic recovery to prevent crashes and
+//    ensure cleanup happens even if ProcessTurn panics.
+//
+// 3. Context Cancellation: The goroutine checks for context cancellation before and
+//    after processing to allow quick termination when the session is closed.
+//
+// 4. Atomic Counter: The manager tracks active goroutines via atomic counter for
+//    monitoring and debugging (see GetActiveGoroutineCount).
+//
+// Thread-Safety:
+// - The session reference prevents the session from being closed while processing
+// - Session.Close() will block until this goroutine exits (via reference counting)
+// - Context cancellation provides a signal to exit quickly
+//
+// See GOROUTINE_LIFECYCLE.md for detailed documentation.
 func (m *manager) handleUserTurn(ctx context.Context, session *Session, op *protocol.OpUserTurn) error {
 	// Check if session can accept the turn
 	if !session.CanAcceptTurn() {
+		session.Release()
 		return fmt.Errorf("session %s cannot accept turn in state %s", session.ID(), session.State())
 	}
 
 	// Submit the turn to the session
 	submissionID, err := session.SubmitTurn(ctx, op)
 	if err != nil {
+		session.Release()
 		return fmt.Errorf("failed to submit turn: %w", err)
 	}
 
 	// Record submission to history if enabled
 	session.RecordSubmission(&protocol.Submission{ID: submissionID, Op: op})
 
+	// Increment active goroutine counter for metrics
+	atomic.AddInt64(&m.activeGoroutines, 1)
+
 	// Process the turn in a goroutine
+	// The goroutine takes ownership of the session reference
 	go func() {
+		// Ensure session reference is released when goroutine completes
+		defer session.Release()
+
+		// Decrement active goroutine counter
+		defer atomic.AddInt64(&m.activeGoroutines, -1)
+
+		// Panic recovery to prevent crashes and resource leaks
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC in turn processing goroutine for session %s, submission %s: %v",
+					session.ID(), submissionID, r)
+
+				// Attempt to emit error event
+				processor := NewTurnProcessorWithApprovalHandler(session, submissionID)
+				_ = processor.emitError(context.Background(), submissionID,
+					fmt.Sprintf("Internal error: %v", r))
+
+				// Mark turn as failed
+				_ = session.FailTurn(fmt.Sprintf("panic: %v", r))
+
+				// Clean up approval handler
+				session.ClearApprovalHandler()
+			}
+		}()
+
 		// Use session context for cancellation
 		turnCtx := session.Context()
+
+		// Check if context is already cancelled before starting
+		select {
+		case <-turnCtx.Done():
+			log.Printf("Session %s context cancelled before turn processing started", session.ID())
+			_ = session.FailTurn("session context cancelled")
+			return
+		default:
+		}
 
 		processor := NewTurnProcessorWithApprovalHandler(session, submissionID)
 
@@ -269,6 +426,13 @@ func (m *manager) handleUserTurn(ctx context.Context, session *Session, op *prot
 		}()
 
 		if err := processor.ProcessTurn(turnCtx, submissionID, op); err != nil {
+			// Check if error is due to context cancellation
+			if turnCtx.Err() != nil {
+				log.Printf("Turn processing cancelled for session %s: %v", session.ID(), turnCtx.Err())
+				_ = session.FailTurn("turn cancelled")
+				return
+			}
+
 			// Mark turn as failed
 			_ = session.FailTurn(err.Error()) // nolint:errcheck
 
@@ -294,6 +458,15 @@ func (m *manager) handleUserTurn(ctx context.Context, session *Session, op *prot
 			if m.notifier != nil {
 				lastMsg := session.GetLastAgentMessage()
 				_ = m.notifier.NotifyTurnComplete(turnCtx, session.ID(), submissionID, lastMsg)
+			}
+		}
+
+		// Save session state after turn completion if history store is available
+		if m.historyStore != nil {
+			state := session.ExtractState()
+			if err := m.historyStore.SaveSession(context.Background(), state); err != nil {
+				// Log error but don't fail the turn
+				log.Printf("WARNING: Failed to save session state after turn for %s: %v", session.ID(), err)
 			}
 		}
 	}()
@@ -453,11 +626,23 @@ func (m *manager) Close() error {
 	// Clear sessions map
 	m.sessions = make(map[string]*Session)
 
+	// Log if there are still active goroutines (shouldn't happen if Close() worked correctly)
+	remaining := atomic.LoadInt64(&m.activeGoroutines)
+	if remaining > 0 {
+		log.Printf("WARNING: Manager closed with %d active goroutines still running", remaining)
+	}
+
 	if len(errors) > 0 {
 		return fmt.Errorf("errors closing sessions: %v", errors)
 	}
 
 	return nil
+}
+
+// GetActiveGoroutineCount returns the number of active turn processing goroutines.
+// This is useful for monitoring and debugging goroutine leaks.
+func (m *manager) GetActiveGoroutineCount() int64 {
+	return atomic.LoadInt64(&m.activeGoroutines)
 }
 
 // ResumeSession loads an existing session from history if not in memory.
@@ -466,10 +651,21 @@ func (m *manager) Close() error {
 // - Token usage statistics
 // - Turn context (cwd, approval policy, sandbox policy, model)
 // - Session state validation
+//
+// If a HistoryStore is configured, it will attempt to load the session state
+// from the store first for faster resume. Otherwise, it falls back to
+// reconstructing state from the history.jsonl file.
 func (m *manager) ResumeSession(ctx context.Context, sessionID string) (*Session, error) {
 	// Check in-memory first
 	if session, err := m.GetSession(sessionID); err == nil {
 		return session, nil
+	}
+
+	// SECURITY: Validate session ID to prevent path traversal attacks
+	if err := ValidateSessionID(sessionID); err != nil {
+		// Log security violation
+		log.Printf("SECURITY WARNING: Invalid session ID rejected in ResumeSession: %v", err)
+		return nil, fmt.Errorf("invalid session ID: %w", err)
 	}
 
 	// Require history configuration
@@ -477,32 +673,73 @@ func (m *manager) ResumeSession(ctx context.Context, sessionID string) (*Session
 		return nil, fmt.Errorf("history persistence not configured")
 	}
 
-	// Open history
-	sessionDir := filepath.Join(m.sessionsRoot, sessionID)
+	// SECURITY: Use validated path construction to prevent directory traversal
+	sessionDir, err := ValidateAndResolveSessionPath(sessionID, m.sessionsRoot)
+	if err != nil {
+		// Log security violation
+		log.Printf("SECURITY WARNING: Session path validation failed in ResumeSession for ID %q: %v",
+			sanitizeSessionIDForLog(sessionID), err)
+		return nil, fmt.Errorf("failed to resolve session path: %w", err)
+	}
+
 	hp, err := persistence.NewHistoryPersistence(m.historyFs, sessionDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open history: %w", err)
 	}
 
-	// Load history entries (both submissions and events)
-	submissions, events, err := hp.LoadHistory()
-	if err != nil {
-		return nil, fmt.Errorf("failed to load history: %w", err)
+	// Try to load session state from history store if available
+	// This is faster than reconstructing from history.jsonl
+	var turnCtx *TurnContext
+	var tokenUsage *protocol.TokenUsage
+	var lastAgentMessage string
+	var historyLogID uint64
+	var historyEntryCount int
+	var provider string
+
+	if m.historyStore != nil {
+		savedState, err := m.historyStore.LoadSession(ctx, sessionID)
+		if err == nil {
+			// Successfully loaded state from store
+			turnCtx = savedState.TurnContext
+			tokenUsage = savedState.TokenUsage
+			lastAgentMessage = savedState.LastAgentMessage
+			historyLogID = savedState.HistoryLogID
+			historyEntryCount = savedState.HistoryEntryCount
+			provider = savedState.Provider
+			log.Printf("Restored session %s from history store (updated at %s)", sessionID, savedState.UpdatedAt)
+		} else if err != ErrSessionNotFound {
+			// Log error but continue with reconstruction
+			log.Printf("WARNING: Failed to load session state from store for %s: %v", sessionID, err)
+		}
 	}
 
-	// Reconstruct complete session state from history
-	reconstructed, err := ReconstructStateFromHistory(submissions, events)
-	if err != nil {
-		return nil, fmt.Errorf("failed to reconstruct state: %w", err)
-	}
+	// If we didn't get state from the store, reconstruct from history
+	if turnCtx == nil {
+		// Load history entries (both submissions and events)
+		submissions, events, err := hp.LoadHistory()
+		if err != nil {
+			return nil, fmt.Errorf("failed to load history: %w", err)
+		}
 
-	// Validate reconstructed state
-	if err := ValidateResumedState(reconstructed); err != nil {
-		return nil, fmt.Errorf("invalid session state: %w", err)
+		// Reconstruct complete session state from history
+		reconstructed, err := ReconstructStateFromHistory(submissions, events)
+		if err != nil {
+			return nil, fmt.Errorf("failed to reconstruct state: %w", err)
+		}
+
+		// Validate reconstructed state
+		if err := ValidateResumedState(reconstructed); err != nil {
+			return nil, fmt.Errorf("invalid session state: %w", err)
+		}
+
+		// Use reconstructed state
+		turnCtx = reconstructed.TurnContext
+		tokenUsage = reconstructed.TokenUsage
+		lastAgentMessage = reconstructed.LastAgentMessage
+		historyEntryCount = reconstructed.CompletedTurns
 	}
 
 	// Ensure we have a valid turn context
-	turnCtx := reconstructed.TurnContext
 	if turnCtx == nil {
 		// Fallback to defaults if reconstruction failed
 		turnCtx = &TurnContext{
@@ -520,35 +757,19 @@ func (m *manager) ResumeSession(ctx context.Context, sessionID string) (*Session
 		TurnContext:  turnCtx,
 		Orchestrator: m.orch,
 		History:      hp,
+		Provider:     provider,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
-	// Restore session state from reconstruction
-	if reconstructed.LastAgentMessage != "" {
-		sess.SetLastAgentMessage(reconstructed.LastAgentMessage)
+	// Restore session state
+	if lastAgentMessage != "" {
+		sess.SetLastAgentMessage(lastAgentMessage)
 	}
 
-	if reconstructed.TokenUsage != nil {
-		sess.UpdateTokenUsage(reconstructed.TokenUsage)
-	}
-
-	// Log reconstruction statistics for observability
-	// In production, you might want to emit metrics here
-	_ = reconstructed.TotalTurns
-	_ = reconstructed.CompletedTurns
-	_ = reconstructed.TotalToolExecutions
-
-	// Check for interrupted turns
-	if reconstructed.HasIncompleteTurn {
-		// Session starts in idle state by default, which is correct for incomplete turns
-		// The user can submit a new turn when ready
-	}
-
-	if reconstructed.InterruptedTurnID != "" {
-		// The last turn was interrupted - session should be in idle or interrupted state
-		// The state machine will handle this correctly
+	if tokenUsage != nil {
+		sess.UpdateTokenUsage(tokenUsage)
 	}
 
 	// Store in manager
@@ -556,8 +777,8 @@ func (m *manager) ResumeSession(ctx context.Context, sessionID string) (*Session
 	m.sessions[sessionID] = sess
 	m.mu.Unlock()
 
-	// Set history metadata (using reconstructed turn count as entry count)
-	sess.SetHistoryMetadata(0, reconstructed.CompletedTurns)
+	// Set history metadata
+	sess.SetHistoryMetadata(historyLogID, historyEntryCount)
 
 	// Emit session configured event for resumed session
 	if err := sess.EmitSessionConfigured(ctx); err != nil {

@@ -19,6 +19,11 @@ import (
 // - Event handling
 // - History tracking
 // - Approval workflow coordination
+//
+// Thread-Safety Guarantees:
+// - All public methods are safe for concurrent use
+// - Reference counting prevents use-after-close
+// - Close() waits for all active operations to complete
 type Session struct {
     // Immutable fields (set at creation)
     id        string
@@ -40,6 +45,12 @@ type Session struct {
     reconstructedHistory []client.Message // Messages from history reconstruction for resume
     historyLogID         uint64           // ID for history log
     historyEntryCount    int              // Number of entries in history
+
+    // Reference counting for safe concurrent access
+    // Prevents deletion while operations are in progress
+    refCount     int32         // Number of active operations using this session
+    closing      bool          // True when Close() has been called
+    closeDone    chan struct{} // Closed when all references are released
 
     // History persistence
     history          *persistence.HistoryPersistence
@@ -119,8 +130,11 @@ func NewSession(cfg SessionConfig) (*Session, error) {
             OutputTokens: 0,
             TotalTokens:  0,
         },
-        ctx:    ctx,
-        cancel: cancel,
+        refCount:  0,
+        closing:   false,
+        closeDone: make(chan struct{}),
+        ctx:       ctx,
+        cancel:    cancel,
     }
 
     if cfg.History != nil {
@@ -146,31 +160,117 @@ func (s *Session) State() SessionState {
 	return s.stateMachine.GetState()
 }
 
+// ExtractState creates a SessionPersistentState snapshot from the current session.
+// This is used by the HistoryStore to persist session state.
+// Thread-safe: acquires read lock to safely read session fields.
+func (s *Session) ExtractState() *SessionPersistentState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return &SessionPersistentState{
+		SessionID:         s.id,
+		CreatedAt:         s.createdAt,
+		UpdatedAt:         time.Now(),
+		TurnContext:       s.turnContext,
+		TokenUsage:        s.tokenUsage,
+		LastAgentMessage:  s.lastAgentMessage,
+		HistoryLogID:      s.historyLogID,
+		HistoryEntryCount: s.historyEntryCount,
+		Provider:          s.provider,
+		State:             s.stateMachine.GetState(),
+		ErrorMessage:      s.stateMachine.GetErrorMessage(),
+		CurrentTurnID:     s.currentTurnID,
+	}
+}
+
 // IsClosed returns whether the session is closed.
 func (s *Session) IsClosed() bool {
 	return s.stateMachine.IsTerminal()
 }
 
 // Close closes the session and cancels any ongoing operations.
+// It waits for all active operations (references) to complete before closing.
+// This prevents use-after-free races with concurrent operations.
 func (s *Session) Close() error {
     s.mu.Lock()
-    defer s.mu.Unlock()
 
 	if s.stateMachine.IsTerminal() {
+        s.mu.Unlock()
 		return fmt.Errorf("session already closed")
 	}
 
+    // Mark session as closing to prevent new operations
+    if s.closing {
+        s.mu.Unlock()
+        return fmt.Errorf("session is already closing")
+    }
+    s.closing = true
+
     if err := s.stateMachine.Transition(StateClosed); err != nil {
+        s.mu.Unlock()
         return fmt.Errorf("failed to close session: %w", err)
     }
 
+    // Cancel context to signal ongoing operations to stop
     s.cancel()
 
+    // Check if there are active references
+    refCount := s.refCount
+    s.mu.Unlock()
+
+    // Wait for all active operations to complete
+    if refCount > 0 {
+        <-s.closeDone
+    }
+
+    // Now safe to clean up resources
+    s.mu.Lock()
     if s.historyEnabled && s.history != nil {
         _ = s.history.Flush()
         _ = s.history.Close()
     }
+    s.mu.Unlock()
+
     return nil
+}
+
+// Acquire increments the reference count for this session.
+// Returns an error if the session is closing or closed.
+// Callers MUST call Release() when done to prevent resource leaks.
+func (s *Session) Acquire() error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    if s.closing {
+        return fmt.Errorf("session %s is closing", s.id)
+    }
+
+    if s.stateMachine.IsTerminal() {
+        return fmt.Errorf("session %s is closed", s.id)
+    }
+
+    s.refCount++
+    return nil
+}
+
+// Release decrements the reference count for this session.
+// When the reference count reaches zero and the session is closing,
+// it signals the Close() method that it can complete cleanup.
+func (s *Session) Release() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    if s.refCount <= 0 {
+        // This should never happen if Acquire/Release are used correctly
+        return
+    }
+
+    s.refCount--
+
+    // If this was the last reference and we're closing, signal completion
+    if s.refCount == 0 && s.closing {
+        close(s.closeDone)
+    }
 }
 
 // CanAcceptTurn returns whether the session can accept a new turn.

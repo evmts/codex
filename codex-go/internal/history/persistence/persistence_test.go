@@ -362,7 +362,8 @@ func TestGetSessionHistoryPath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := GetSessionHistoryPath("/sessions", tt.sessionID)
+			path, err := GetSessionHistoryPath("/sessions", tt.sessionID)
+			require.NoError(t, err)
 			assert.Equal(t, tt.wantPath, path)
 		})
 	}
@@ -388,7 +389,8 @@ func TestGetSessionDir(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := GetSessionDir("/sessions", tt.sessionID)
+			dir, err := GetSessionDir("/sessions", tt.sessionID)
+			require.NoError(t, err)
 			assert.Equal(t, tt.wantDir, dir)
 		})
 	}
