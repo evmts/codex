@@ -14,6 +14,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -78,8 +80,17 @@ func (s *ShellTool) Execute(ctx context.Context, req *runtime.ToolRequest, execC
 		)
 	}
 
+	// Sanitize command to prevent basic injection attacks
+	sanitizedCommand := SanitizeCommand(args.Command)
+	if sanitizedCommand == "" {
+		return nil, runtime.NewToolError(
+			runtime.ErrorInvalidArguments,
+			"command is empty after sanitization",
+		)
+	}
+
 	// Build command array
-	cmdArray := buildCommandArray(args.Command)
+	cmdArray := buildCommandArray(sanitizedCommand)
 
 	// Determine working directory
 	workingDir := req.WorkingDirectory
@@ -90,13 +101,23 @@ func (s *ShellTool) Execute(ctx context.Context, req *runtime.ToolRequest, execC
 		workingDir = "."
 	}
 
-	// Merge environment variables
+	// Validate working directory
+	if err := validateWorkingDirectory(workingDir, execCtx); err != nil {
+		return nil, err
+	}
+
+	// Merge and validate environment variables
 	env := make(map[string]string)
 	for k, v := range req.Environment {
 		env[k] = v
 	}
 	for k, v := range args.Environment {
 		env[k] = v
+	}
+
+	// Validate environment variables for security
+	if err := validateEnvironmentVariables(env); err != nil {
+		return nil, err
 	}
 
 	// Create command spec
@@ -107,7 +128,18 @@ func (s *ShellTool) Execute(ctx context.Context, req *runtime.ToolRequest, execC
 		CallID:           req.CallID,
 	}
 
-	// Execute the command
+	// Apply timeout from arguments if specified
+	if args.Timeout > 0 {
+		timeout := time.Duration(args.Timeout) * time.Millisecond
+		return s.executor.ExecuteWithTimeout(ctx, spec, execCtx, timeout)
+	}
+
+	// Execute the command with default timeout from request
+	if req.Timeout > 0 {
+		return s.executor.ExecuteWithTimeout(ctx, spec, execCtx, req.Timeout)
+	}
+
+	// Execute without timeout
 	result, err := s.executor.Execute(ctx, spec, execCtx)
 	if err != nil {
 		return nil, err
@@ -272,4 +304,148 @@ func formatDuration(d time.Duration) string {
 		return d.Round(100 * time.Millisecond).String()
 	}
 	return d.Round(time.Second).String()
+}
+
+// validateWorkingDirectory validates the working directory for security issues.
+// It checks for:
+//   - Directory existence
+//   - Path traversal attempts
+//   - Workspace boundary violations (when sandboxed)
+func validateWorkingDirectory(workingDir string, execCtx *runtime.ExecutionContext) error {
+	// Resolve to absolute path
+	absPath, err := filepath.Abs(workingDir)
+	if err != nil {
+		return runtime.NewToolErrorWithCause(
+			runtime.ErrorInvalidArguments,
+			fmt.Sprintf("invalid working directory path: %s", workingDir),
+			err,
+		)
+	}
+
+	// Check if directory exists
+	info, err := os.Stat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return runtime.NewToolError(
+				runtime.ErrorInvalidArguments,
+				fmt.Sprintf("working directory does not exist: %s", absPath),
+			)
+		}
+		return runtime.NewToolErrorWithCause(
+			runtime.ErrorInvalidArguments,
+			fmt.Sprintf("cannot access working directory: %s", absPath),
+			err,
+		)
+	}
+
+	// Verify it's actually a directory
+	if !info.IsDir() {
+		return runtime.NewToolError(
+			runtime.ErrorInvalidArguments,
+			fmt.Sprintf("working directory path is not a directory: %s", absPath),
+		)
+	}
+
+	// Check for path traversal attempts by detecting ".." in the path
+	cleanPath := filepath.Clean(absPath)
+	if strings.Contains(cleanPath, "..") {
+		return runtime.NewToolError(
+			runtime.ErrorInvalidArguments,
+			fmt.Sprintf("path traversal detected in working directory: %s", workingDir),
+		)
+	}
+
+	// When sandboxed with workspace restrictions, validate we're within workspace bounds
+	if execCtx.SandboxAttempt != nil {
+		policy := execCtx.SandboxAttempt.Policy
+		if policy == runtime.SandboxReadOnly || policy == runtime.SandboxWorkspaceWrite {
+			workspaceRoot := execCtx.SandboxAttempt.WorkingDirectory
+			if workspaceRoot != "" {
+				absWorkspace, err := filepath.Abs(workspaceRoot)
+				if err == nil {
+					// Check if the working directory is within workspace bounds
+					relPath, err := filepath.Rel(absWorkspace, absPath)
+					if err != nil || strings.HasPrefix(relPath, "..") {
+						return runtime.NewToolError(
+							runtime.ErrorInvalidArguments,
+							fmt.Sprintf("working directory %s is outside workspace bounds %s", absPath, absWorkspace),
+						)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateEnvironmentVariables validates environment variables for security issues.
+// It checks for dangerous variables that could compromise sandbox security.
+func validateEnvironmentVariables(env map[string]string) error {
+	// Dangerous environment variables that should never be overridden in sandboxed contexts
+	dangerousVars := []string{
+		"LD_PRELOAD",      // Can inject malicious libraries
+		"LD_LIBRARY_PATH", // Can redirect library loading
+		"DYLD_INSERT_LIBRARIES", // macOS equivalent of LD_PRELOAD
+		"DYLD_LIBRARY_PATH",     // macOS equivalent of LD_LIBRARY_PATH
+		"DYLD_FRAMEWORK_PATH",   // Can redirect framework loading on macOS
+		"PYTHONPATH",      // Can inject malicious Python modules
+		"PERLLIB",         // Can inject malicious Perl modules
+		"PERL5LIB",        // Can inject malicious Perl modules
+		"RUBYLIB",         // Can inject malicious Ruby modules
+		"NODE_PATH",       // Can inject malicious Node.js modules
+	}
+
+	for _, dangerous := range dangerousVars {
+		if _, exists := env[dangerous]; exists {
+			return runtime.NewToolError(
+				runtime.ErrorInvalidArguments,
+				fmt.Sprintf("dangerous environment variable not allowed: %s", dangerous),
+			)
+		}
+	}
+
+	// Validate PATH doesn't contain suspicious entries
+	if pathValue, exists := env["PATH"]; exists {
+		// Check for path entries that could be dangerous
+		pathParts := filepath.SplitList(pathValue)
+		for _, part := range pathParts {
+			// Detect relative paths in PATH (security risk)
+			if !filepath.IsAbs(part) && part != "" {
+				return runtime.NewToolError(
+					runtime.ErrorInvalidArguments,
+					fmt.Sprintf("relative path in PATH environment variable not allowed: %s", part),
+				)
+			}
+			// Detect world-writable directories in PATH
+			if info, err := os.Stat(part); err == nil {
+				mode := info.Mode()
+				if mode.Perm()&0002 != 0 { // World-writable
+					return runtime.NewToolError(
+						runtime.ErrorInvalidArguments,
+						fmt.Sprintf("world-writable directory in PATH not allowed: %s", part),
+					)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// SanitizeCommand performs sanitization on command strings to prevent injection.
+func SanitizeCommand(command string) string {
+	// Remove null bytes
+	command = strings.ReplaceAll(command, "\x00", "")
+
+	// Remove other control characters except newlines and tabs
+	var sanitized strings.Builder
+	for _, r := range command {
+		// Allow printable characters, newlines, and tabs
+		if r >= 32 || r == '\n' || r == '\t' {
+			sanitized.WriteRune(r)
+		}
+	}
+
+	return strings.TrimSpace(sanitized.String())
 }

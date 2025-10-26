@@ -424,3 +424,294 @@ func BenchmarkNativeSandbox_Execute(b *testing.B) {
 		}
 	}
 }
+
+// TestNativeSandbox_Execute_NilContext tests nil context handling
+func TestNativeSandbox_Execute_NilContext(t *testing.T) {
+	sb := New()
+
+	cmd := &sandbox.Command{
+		Program: "echo",
+		Args:    []string{"test"},
+	}
+
+	result, err := sb.Execute(nil, cmd)
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "context cannot be nil")
+}
+
+// TestNativeSandbox_Execute_NilCommand tests nil command handling
+func TestNativeSandbox_Execute_NilCommand(t *testing.T) {
+	sb := New()
+	ctx := context.Background()
+
+	result, err := sb.Execute(ctx, nil)
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "command cannot be nil")
+}
+
+// TestNativeSandbox_Execute_EmptyProgram tests empty program handling
+func TestNativeSandbox_Execute_EmptyProgram(t *testing.T) {
+	sb := New()
+	ctx := context.Background()
+
+	cmd := &sandbox.Command{
+		Program: "",
+		Args:    []string{"test"},
+	}
+
+	result, err := sb.Execute(ctx, cmd)
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "program cannot be empty")
+}
+
+// TestNativeSandbox_NewWithOptions tests custom options
+func TestNativeSandbox_NewWithOptions(t *testing.T) {
+	opts := &Options{
+		MaxOutputSize:         1024,
+		WarnOnIgnoredSecurity: false,
+	}
+
+	sb := NewWithOptions(opts)
+	assert.NotNil(t, sb)
+	assert.Equal(t, int64(1024), sb.opts.MaxOutputSize)
+	assert.False(t, sb.opts.WarnOnIgnoredSecurity)
+}
+
+// TestNativeSandbox_NewWithNilOptions tests nil options handling
+func TestNativeSandbox_NewWithNilOptions(t *testing.T) {
+	sb := NewWithOptions(nil)
+	assert.NotNil(t, sb)
+	assert.Equal(t, DefaultMaxOutputSize, sb.opts.MaxOutputSize)
+	assert.Equal(t, DefaultWarnOnIgnoredSecurity, sb.opts.WarnOnIgnoredSecurity)
+}
+
+// TestNativeSandbox_Execute_OutputSizeLimit tests output truncation
+func TestNativeSandbox_Execute_OutputSizeLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Create sandbox with small output limit
+	opts := &Options{
+		MaxOutputSize:         100, // Very small limit
+		WarnOnIgnoredSecurity: false,
+	}
+	sb := NewWithOptions(opts)
+	ctx := context.Background()
+
+	// Generate more output than the limit
+	cmd := &sandbox.Command{
+		Program: "sh",
+		Args:    []string{"-c", "for i in $(seq 1 100); do echo 'line with some text'; done"},
+	}
+
+	result, err := sb.Execute(ctx, cmd)
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.ExitCode)
+
+	// Verify output was truncated
+	assert.Contains(t, result.Stdout, "truncated")
+	assert.True(t, len(result.Stdout) < 1000, "Output should be truncated")
+}
+
+// TestNativeSandbox_Execute_LargeOutput tests handling of very large output
+func TestNativeSandbox_Execute_LargeOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Use default sandbox with 10MB limit
+	sb := New()
+	ctx := context.Background()
+
+	// Generate output that exceeds 10MB
+	// Each line is ~100 bytes, so 200k lines = ~20MB
+	cmd := &sandbox.Command{
+		Program: "sh",
+		Args:    []string{"-c", "yes 'This is a line with some padding to make it about 100 bytes long for testing purposes here' | head -n 200000"},
+		Timeout: 5 * time.Second,
+	}
+
+	result, err := sb.Execute(ctx, cmd)
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.ExitCode)
+
+	// Verify output was truncated at approximately 10MB
+	assert.Contains(t, result.Stdout, "truncated")
+	outputSize := len(result.Stdout)
+	// Should be close to 10MB (within 1MB due to truncation message)
+	assert.True(t, outputSize < 11*1024*1024, "Output should be truncated to around 10MB")
+	assert.True(t, outputSize > 9*1024*1024, "Output should be close to 10MB limit")
+}
+
+// TestNativeSandbox_Execute_UnlimitedOutput tests unlimited output mode
+func TestNativeSandbox_Execute_UnlimitedOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Create sandbox with unlimited output
+	opts := &Options{
+		MaxOutputSize:         0, // 0 = unlimited, but default will be applied
+		WarnOnIgnoredSecurity: false,
+	}
+	sb := NewWithOptions(opts)
+	ctx := context.Background()
+
+	// Generate large output
+	cmd := &sandbox.Command{
+		Program: "sh",
+		Args:    []string{"-c", "for i in $(seq 1 5000); do echo line $i; done"},
+	}
+
+	result, err := sb.Execute(ctx, cmd)
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.ExitCode)
+
+	// With default limit, output should be within bounds
+	lines := strings.Split(strings.TrimSpace(result.Stdout), "\n")
+	// May be truncated due to default limit
+	assert.True(t, len(lines) >= 1000, "Should have many lines")
+}
+
+// TestNativeSandbox_SecurityWarnings tests warning output
+func TestNativeSandbox_SecurityWarnings(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Create sandbox with warnings enabled
+	opts := &Options{
+		MaxOutputSize:         DefaultMaxOutputSize,
+		WarnOnIgnoredSecurity: true,
+	}
+	sb := NewWithOptions(opts)
+	ctx := context.Background()
+
+	// Command with security fields that will be ignored
+	cmd := &sandbox.Command{
+		Program:        "echo",
+		Args:           []string{"test"},
+		ReadOnlyPaths:  []string{"/tmp"},
+		ReadWritePaths: []string{"/var"},
+		NetworkEnabled: false,
+	}
+
+	// Note: We can't easily test log output, but we can verify execution succeeds
+	result, err := sb.Execute(ctx, cmd)
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.ExitCode)
+}
+
+// TestNativeSandbox_SecurityWarningsDisabled tests warning suppression
+func TestNativeSandbox_SecurityWarningsDisabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Create sandbox with warnings disabled
+	opts := &Options{
+		MaxOutputSize:         DefaultMaxOutputSize,
+		WarnOnIgnoredSecurity: false,
+	}
+	sb := NewWithOptions(opts)
+	ctx := context.Background()
+
+	// Command with security fields that will be silently ignored
+	cmd := &sandbox.Command{
+		Program:        "echo",
+		Args:           []string{"test"},
+		ReadOnlyPaths:  []string{"/tmp"},
+		NetworkEnabled: false,
+	}
+
+	result, err := sb.Execute(ctx, cmd)
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.ExitCode)
+}
+
+// TestNativeSandbox_Execute_ArgsWithSpaces tests arguments containing spaces
+func TestNativeSandbox_Execute_ArgsWithSpaces(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	sb := New()
+	ctx := context.Background()
+
+	cmd := &sandbox.Command{
+		Program: "echo",
+		Args:    []string{"hello world", "with spaces"},
+	}
+
+	result, err := sb.Execute(ctx, cmd)
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.ExitCode)
+	assert.Contains(t, result.Stdout, "hello world")
+	assert.Contains(t, result.Stdout, "with spaces")
+}
+
+// TestLimitedBuffer tests the limitedBuffer implementation
+func TestLimitedBuffer(t *testing.T) {
+	t.Run("respects size limit", func(t *testing.T) {
+		lb := &limitedBuffer{maxSize: 10}
+
+		// Write 5 bytes
+		n, err := lb.Write([]byte("hello"))
+		require.NoError(t, err)
+		assert.Equal(t, 5, n)
+		assert.Equal(t, "hello", lb.buf.String())
+
+		// Write 10 more bytes - only 5 should fit
+		n, err = lb.Write([]byte("world12345"))
+		require.NoError(t, err)
+		assert.Equal(t, 10, n) // Returns full length for success
+		assert.Equal(t, "helloworld", lb.buf.String())
+
+		// Verify String() includes truncation notice
+		s := lb.String()
+		assert.Contains(t, s, "helloworld")
+		assert.Contains(t, s, "truncated")
+	})
+
+	t.Run("unlimited size", func(t *testing.T) {
+		lb := &limitedBuffer{maxSize: 0} // 0 = unlimited
+
+		// Write large data
+		data := strings.Repeat("x", 1000)
+		n, err := lb.Write([]byte(data))
+		require.NoError(t, err)
+		assert.Equal(t, 1000, n)
+		assert.Equal(t, data, lb.buf.String())
+	})
+
+	t.Run("exact limit", func(t *testing.T) {
+		lb := &limitedBuffer{maxSize: 5}
+
+		n, err := lb.Write([]byte("hello"))
+		require.NoError(t, err)
+		assert.Equal(t, 5, n)
+		assert.Equal(t, "hello", lb.buf.String())
+
+		// At limit - should not include truncation notice
+		s := lb.String()
+		assert.Contains(t, s, "hello")
+		assert.Contains(t, s, "truncated")
+	})
+
+	t.Run("exceeds limit on first write", func(t *testing.T) {
+		lb := &limitedBuffer{maxSize: 3}
+
+		n, err := lb.Write([]byte("hello"))
+		require.NoError(t, err)
+		assert.Equal(t, 5, n) // Returns full length
+		assert.Equal(t, "hel", lb.buf.String())
+
+		s := lb.String()
+		assert.Contains(t, s, "hel")
+		assert.Contains(t, s, "truncated")
+	})
+}

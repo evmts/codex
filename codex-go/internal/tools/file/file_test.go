@@ -3,6 +3,7 @@ package file
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,7 +295,12 @@ func TestReadTool_PathTraversal(t *testing.T) {
 
 	_, err := tool.Execute(ctx, req, execCtx)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "outside workspace")
+	// Error should indicate path traversal or being outside workspace
+	errMsg := err.Error()
+	assert.True(t, strings.Contains(errMsg, "outside workspace") ||
+		strings.Contains(errMsg, "traversal") ||
+		strings.Contains(errMsg, "suspicious path pattern"),
+		"Expected path traversal error, got: %s", errMsg)
 }
 
 func TestReadTool_LineRange(t *testing.T) {
@@ -469,7 +475,12 @@ func TestWriteTool_PathTraversal(t *testing.T) {
 
 	_, err := tool.Execute(ctx, req, execCtx)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "outside workspace")
+	// Error should indicate path traversal or being outside workspace
+	errMsg := err.Error()
+	assert.True(t, strings.Contains(errMsg, "outside workspace") ||
+		strings.Contains(errMsg, "traversal") ||
+		strings.Contains(errMsg, "suspicious path pattern"),
+		"Expected path traversal error, got: %s", errMsg)
 }
 
 func TestWriteTool_AtomicWrite(t *testing.T) {

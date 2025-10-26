@@ -429,7 +429,9 @@ func TestFullSessionWithPersistence(t *testing.T) {
         require.NoError(t, mgr2.Close())
 
         // Verify history file exists
-        exists, err := afero.Exists(fs, persistence.GetSessionHistoryPath("/sessions", "persist-1"))
+        historyPath, err := persistence.GetSessionHistoryPath("/sessions", "persist-1")
+        require.NoError(t, err)
+        exists, err := afero.Exists(fs, historyPath)
         require.NoError(t, err)
         assert.True(t, exists)
 

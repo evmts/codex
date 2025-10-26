@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/evmts/codex/codex-go/internal/sandbox"
@@ -25,9 +24,6 @@ type CommandSpec struct {
 
 	// CallID identifies this command execution
 	CallID string
-
-	// SandboxPolicy specifies the sandbox policy to apply (optional)
-	SandboxPolicy *sandbox.PolicyConfig
 }
 
 // CommandExecutor handles the execution of shell commands.
@@ -43,6 +39,7 @@ func NewCommandExecutor() *CommandExecutor {
 }
 
 // Execute runs a command and returns the result.
+// Sandbox policy is determined by the ExecutionContext's SandboxAttempt, which is set by the orchestrator.
 func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCtx *runtime.ExecutionContext) (*runtime.ToolResponse, error) {
 	startTime := time.Now()
 
@@ -91,15 +88,19 @@ func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCt
 		cmd.Stderr = capturer.stderr
 	}
 
-	// Apply sandbox policy if specified
+	// Apply sandbox from ExecutionContext (set by orchestrator)
+	// This ensures ALL commands go through the sandbox orchestrator's policy
 	var sandboxInfo *sandbox.SandboxInfo
-	if spec.SandboxPolicy != nil {
+	if execCtx.SandboxAttempt != nil && execCtx.SandboxAttempt.Policy != runtime.SandboxDangerFullAccess {
+		// Convert runtime.SandboxPolicy to sandbox.PolicyConfig
+		sandboxPolicy := convertToSandboxPolicy(execCtx.SandboxAttempt)
+
 		workspace := spec.WorkingDirectory
 		if workspace == "" {
 			workspace = "."
 		}
 
-		info, err := e.sandboxManager.ApplyToCommand(cmd, spec.SandboxPolicy, workspace)
+		info, err := e.sandboxManager.ApplyToCommand(cmd, sandboxPolicy, workspace)
 		if err != nil {
 			return nil, runtime.NewToolErrorWithCause(
 				runtime.ErrorExecution,
@@ -108,6 +109,13 @@ func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCt
 			)
 		}
 		sandboxInfo = info
+	} else {
+		// No sandbox or danger-full-access mode
+		sandboxInfo = &sandbox.SandboxInfo{
+			Type:    sandbox.SandboxTypeNone,
+			Applied: false,
+			Reason:  "no sandbox policy or full access mode",
+		}
 	}
 
 	// Execute the command
@@ -177,6 +185,26 @@ func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCt
 	return resp, nil
 }
 
+// convertToSandboxPolicy converts runtime.SandboxAttempt to sandbox.PolicyConfig
+func convertToSandboxPolicy(attempt *runtime.SandboxAttempt) *sandbox.PolicyConfig {
+	switch attempt.Policy {
+	case runtime.SandboxReadOnly:
+		return sandbox.NewReadOnlyPolicy()
+	case runtime.SandboxWorkspaceWrite:
+		config := sandbox.NewWorkspaceWritePolicy()
+		// Apply network settings from attempt if available
+		if config.WorkspaceWriteConfig != nil {
+			config.WorkspaceWriteConfig.NetworkAccess = attempt.NetworkEnabled
+		}
+		return config
+	case runtime.SandboxDangerFullAccess:
+		return sandbox.NewDangerFullAccessPolicy()
+	default:
+		// Default to read-only for safety
+		return sandbox.NewReadOnlyPolicy()
+	}
+}
+
 // ExecuteWithTimeout executes a command with a timeout.
 func (e *CommandExecutor) ExecuteWithTimeout(ctx context.Context, spec *CommandSpec, execCtx *runtime.ExecutionContext, timeout time.Duration) (*runtime.ToolResponse, error) {
 	if timeout > 0 {
@@ -192,12 +220,4 @@ func (e *CommandExecutor) ExecuteWithTimeout(ctx context.Context, spec *CommandS
 func IsCommandAvailable(command string) bool {
 	_, err := exec.LookPath(command)
 	return err == nil
-}
-
-// SanitizeCommand performs basic sanitization on command strings.
-// This is a simple implementation and should be enhanced for production use.
-func SanitizeCommand(command string) string {
-	// Remove null bytes
-	command = strings.ReplaceAll(command, "\x00", "")
-	return strings.TrimSpace(command)
 }

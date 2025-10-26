@@ -1,10 +1,12 @@
 package file
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -275,12 +277,14 @@ func TestResolvePathErrors(t *testing.T) {
 }
 
 func TestSymlinkSafety(t *testing.T) {
-	// Create temporary workspace
-	workspace := t.TempDir()
+	// Create temporary workspace and resolve it (for macOS /var -> /private/var)
+	tempWorkspace := t.TempDir()
+	workspace, err := filepath.EvalSymlinks(tempWorkspace)
+	require.NoError(t, err)
 
 	// Create a file inside workspace
 	targetFile := filepath.Join(workspace, "target.txt")
-	err := os.WriteFile(targetFile, []byte("test"), 0644)
+	err = os.WriteFile(targetFile, []byte("test"), 0644)
 	require.NoError(t, err)
 
 	// Create a symlink inside workspace pointing to target (safe)
@@ -663,4 +667,495 @@ func TestEdgeCases(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEnhancedPathTraversal tests the new enhanced path traversal detection
+func TestEnhancedPathTraversal(t *testing.T) {
+	workspace := t.TempDir()
+
+	tests := []struct {
+		name      string
+		path      string
+		expectErr bool
+		errType   ValidationErrorType
+	}{
+		{
+			name:      "double encoded dots",
+			path:      "%252e%252e/file.txt",
+			expectErr: true,
+			errType:   ErrorPathTraversal,
+		},
+		{
+			name:      "double encoded slash",
+			path:      "..%252ffile.txt",
+			expectErr: true,
+			errType:   ErrorPathTraversal,
+		},
+		{
+			name:      "triple dots",
+			path:      ".../file.txt",
+			expectErr: true,
+			errType:   ErrorPathTraversal,
+		},
+		{
+			name:      "many dots",
+			path:      "......./file.txt",
+			expectErr: true,
+			errType:   ErrorPathTraversal,
+		},
+		{
+			name:      "URL encoded then path traversal",
+			path:      "%2e%2e%2f%2e%2e%2ffile.txt",
+			expectErr: true,
+			errType:   ErrorPathTraversal,
+		},
+		{
+			name:      "mixed encoding backslash",
+			path:      "..%5cfile.txt",
+			expectErr: true,
+			errType:   ErrorPathTraversal,
+		},
+		{
+			name:      "invalid UTF-8",
+			path:      "file\xFF\xFE.txt",
+			expectErr: true,
+			errType:   ErrorInvalidPath,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePathForRead(tt.path, workspace)
+			if tt.expectErr {
+				require.Error(t, err)
+				var valErr *ValidationError
+				require.ErrorAs(t, err, &valErr)
+				assert.Equal(t, tt.errType, valErr.Type)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestSensitiveFilePatterns tests sensitive file pattern matching
+func TestSensitiveFilePatterns(t *testing.T) {
+	workspace := t.TempDir()
+
+	sensitiveFiles := []string{
+		".env",
+		".env.local",
+		".env.production",
+		"credentials.json",
+		"password.txt",
+		"secret.key",
+		"private_key",
+		"private-key.pem",
+		"id_rsa",
+		"id_ed25519",
+		"cert.pem",
+		"server.key",
+		"keystore.p12",
+		"app.keystore",
+		"store.jks",
+		"api_token.txt",
+		"auth_config.json",
+		".npmrc",
+		".pypirc",
+		".netrc",
+		".git-credentials",
+		".dockercfg",
+		"master.key",
+		".htpasswd",
+		"web.config",
+		"appsettings.json",
+		".pgpass",
+		".my.cnf",
+		".s3cfg",
+		".boto",
+		"secrets.tfvars",
+		"connection.ovpn",
+		"server.rdp",
+	}
+
+	for _, filename := range sensitiveFiles {
+		t.Run(filename, func(t *testing.T) {
+			err := ValidatePathForWrite(filename, workspace)
+			require.Error(t, err, "should block sensitive file: %s", filename)
+			var valErr *ValidationError
+			require.ErrorAs(t, err, &valErr)
+			assert.Equal(t, ErrorSensitivePath, valErr.Type)
+		})
+	}
+}
+
+// TestSpecialFileTypes tests rejection of special file types
+func TestSpecialFileTypes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Special file type tests are Unix-specific")
+	}
+
+	workspace := t.TempDir()
+
+	// Test device file (if accessible)
+	t.Run("device file", func(t *testing.T) {
+		// /dev/null should be accessible on Unix systems
+		err := ValidatePathForRead("/dev/null", workspace)
+		// Should fail either due to workspace check or special file check
+		assert.Error(t, err)
+	})
+
+	// Create a named pipe for testing
+	t.Run("named pipe", func(t *testing.T) {
+		pipePath := filepath.Join(workspace, "testpipe")
+		err := syscall.Mkfifo(pipePath, 0666)
+		if err != nil {
+			t.Skip("Cannot create named pipe")
+		}
+		defer os.Remove(pipePath)
+
+		err = ValidatePathForRead(pipePath, workspace)
+		require.Error(t, err)
+		var valErr *ValidationError
+		require.ErrorAs(t, err, &valErr)
+		assert.Equal(t, ErrorSpecialFile, valErr.Type)
+	})
+}
+
+// TestSymlinkChainDepth tests symlink chain depth limits
+func TestSymlinkChainDepth(t *testing.T) {
+	workspace := t.TempDir()
+
+	// Create a deep chain of symlinks within the workspace
+	// Start with a target file
+	targetPath := filepath.Join(workspace, "target.txt")
+	err := os.WriteFile(targetPath, []byte("test"), 0644)
+	require.NoError(t, err)
+
+	// Create a chain where each symlink points to the next one
+	// link0 -> target.txt, link1 -> link0, link2 -> link1, etc.
+	prevPath := targetPath
+	var finalLinkPath string
+	for i := 0; i < 45; i++ {
+		linkPath := filepath.Join(workspace, fmt.Sprintf("link%d", i))
+		// Use absolute path to ensure it stays in workspace
+		err := os.Symlink(prevPath, linkPath)
+		if err != nil {
+			t.Skip("Symlinks not supported")
+		}
+		prevPath = linkPath
+		finalLinkPath = linkPath
+	}
+
+	// Validation should fail due to depth exceeding 40
+	err = ValidatePathForRead(finalLinkPath, workspace)
+	require.Error(t, err)
+	var valErr *ValidationError
+	require.ErrorAs(t, err, &valErr)
+	// Should be either ErrorSymlinkChain or ErrorSymlinkEscape
+	assert.True(t, valErr.Type == ErrorSymlinkChain || valErr.Type == ErrorSymlinkEscape,
+		"Expected ErrorSymlinkChain or ErrorSymlinkEscape, got %v", valErr.Type)
+}
+
+// TestPathDepthLimit tests directory nesting depth limits
+func TestPathDepthLimit(t *testing.T) {
+	workspace := t.TempDir()
+
+	// Create a very deep path (exceeds limit)
+	deepPath := workspace
+	for i := 0; i < 120; i++ {
+		deepPath = filepath.Join(deepPath, "dir")
+	}
+
+	err := ValidatePathForRead(deepPath, workspace)
+	require.Error(t, err)
+	var valErr *ValidationError
+	require.ErrorAs(t, err, &valErr)
+	assert.Equal(t, ErrorPathTooDeep, valErr.Type)
+}
+
+// TestPathLengthLimit tests maximum path length enforcement
+func TestPathLengthLimit(t *testing.T) {
+	workspace := t.TempDir()
+
+	// Create a path that exceeds 4096 bytes
+	longPath := strings.Repeat("a", 5000)
+
+	err := ValidatePathForRead(longPath, workspace)
+	require.Error(t, err)
+	var valErr *ValidationError
+	require.ErrorAs(t, err, &valErr)
+	assert.Equal(t, ErrorInvalidPath, valErr.Type)
+	assert.Contains(t, valErr.Message, "exceeds maximum length")
+}
+
+// TestUnicodeAttacks tests Unicode-based path attacks
+func TestUnicodeAttacks(t *testing.T) {
+	workspace := t.TempDir()
+
+	tests := []struct {
+		name      string
+		path      string
+		expectErr bool
+	}{
+		{
+			name:      "right-to-left override",
+			path:      "file\u202Etxt.exe", // Looks like file.txt but actually file.exe
+			expectErr: true,
+		},
+		{
+			name:      "zero-width space",
+			path:      "file\u200Bname.txt",
+			expectErr: true,
+		},
+		{
+			name:      "zero-width non-joiner",
+			path:      "file\u200Cname.txt",
+			expectErr: true,
+		},
+		{
+			name:      "zero-width joiner",
+			path:      "file\u200Dname.txt",
+			expectErr: true,
+		},
+		{
+			name:      "byte order mark",
+			path:      "\uFEFFfilename.txt",
+			expectErr: true,
+		},
+		{
+			name:      "left-to-right override",
+			path:      "file\u202Dname.txt",
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePathForRead(tt.path, workspace)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestWindowsReservedNames tests Windows reserved filename detection
+func TestWindowsReservedNames(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-specific test")
+	}
+
+	workspace := t.TempDir()
+
+	reservedNames := []string{
+		"CON", "con", "Con.txt",
+		"PRN", "prn", "PRN.log",
+		"AUX", "aux", "AUX.dat",
+		"NUL", "nul", "NUL.txt",
+		"COM1", "com1", "COM1.txt",
+		"LPT1", "lpt1", "LPT1.doc",
+	}
+
+	for _, name := range reservedNames {
+		t.Run(name, func(t *testing.T) {
+			err := ValidatePathForRead(name, workspace)
+			require.Error(t, err)
+			var valErr *ValidationError
+			require.ErrorAs(t, err, &valErr)
+			assert.Equal(t, ErrorInvalidPath, valErr.Type)
+		})
+	}
+}
+
+// TestControlCharacters tests control character detection
+func TestControlCharacters(t *testing.T) {
+	workspace := t.TempDir()
+
+	tests := []struct {
+		name      string
+		path      string
+		expectErr bool
+	}{
+		{
+			name:      "null byte",
+			path:      "file\x00name.txt",
+			expectErr: true,
+		},
+		{
+			name:      "bell character",
+			path:      "file\x07.txt",
+			expectErr: true,
+		},
+		{
+			name:      "escape character",
+			path:      "file\x1B.txt",
+			expectErr: true,
+		},
+		{
+			name:      "C1 control character",
+			path:      "file\x81.txt",
+			expectErr: true,
+		},
+		{
+			name:      "tab is allowed",
+			path:      "file\tname.txt",
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePathForRead(tt.path, workspace)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestSensitivePathCaseInsensitive tests case-insensitive path matching
+func TestSensitivePathCaseInsensitive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping Unix sensitive path tests on Windows")
+	}
+
+	// Test that variations like /ETC are blocked on case-insensitive systems
+	tests := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{
+			name:     "/etc lowercase",
+			path:     "/etc/passwd",
+			expected: true,
+		},
+		{
+			name:     "/etc mixed case",
+			path:     "/Etc/passwd",
+			expected: true,
+		},
+		{
+			name:     "/etc uppercase",
+			path:     "/ETC/PASSWD",
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isSensitivePath(tt.path)
+			if runtime.GOOS == "darwin" {
+				// macOS is case-insensitive, should block all variations
+				assert.Equal(t, tt.expected, result)
+			} else {
+				// Linux is case-sensitive, only lowercase should match
+				if tt.path == "/etc/passwd" {
+					assert.True(t, result)
+				}
+			}
+		})
+	}
+}
+
+// TestSeparatorBoundaryMatching tests proper separator-aware prefix matching
+func TestSeparatorBoundaryMatching(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping Unix path tests on Windows")
+	}
+
+	tests := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{
+			name:     "/etc itself",
+			path:     "/etc",
+			expected: true,
+		},
+		{
+			name:     "/etc/file",
+			path:     "/etc/passwd",
+			expected: true,
+		},
+		{
+			name:     "/etc-backup should NOT match",
+			path:     "/etc-backup/file.txt",
+			expected: false,
+		},
+		{
+			name:     "/etcd should NOT match",
+			path:     "/etcd/config.json",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isSensitivePath(tt.path)
+			assert.Equal(t, tt.expected, result, "Path: %s", tt.path)
+		})
+	}
+}
+
+// TestSymlinkRelativeTarget tests relative symlink target resolution
+func TestSymlinkRelativeTarget(t *testing.T) {
+	// Get the real workspace path (resolves /var -> /private/var on macOS)
+	tempWorkspace := t.TempDir()
+	workspace, err := filepath.EvalSymlinks(tempWorkspace)
+	require.NoError(t, err)
+
+	// Create nested directory structure
+	subdir := filepath.Join(workspace, "subdir")
+	err = os.Mkdir(subdir, 0755)
+	require.NoError(t, err)
+
+	targetFile := filepath.Join(subdir, "target.txt")
+	err = os.WriteFile(targetFile, []byte("test"), 0644)
+	require.NoError(t, err)
+
+	// Create relative symlink in subdir pointing to target in same dir
+	linkPath := filepath.Join(subdir, "link.txt")
+	err = os.Symlink("target.txt", linkPath)
+	if err != nil {
+		t.Skip("Symlinks not supported")
+	}
+
+	// Should be allowed (relative symlink stays in workspace)
+	err = ValidatePathForRead(linkPath, workspace)
+	assert.NoError(t, err)
+
+	// Create relative symlink that escapes using ../
+	escapeLinkPath := filepath.Join(subdir, "escape.txt")
+	err = os.Symlink("../../../etc/passwd", escapeLinkPath)
+	require.NoError(t, err)
+
+	// Should be blocked (escapes workspace)
+	err = ValidatePathForRead(escapeLinkPath, workspace)
+	require.Error(t, err)
+	var valErr *ValidationError
+	require.ErrorAs(t, err, &valErr)
+	assert.Equal(t, ErrorSymlinkEscape, valErr.Type)
+}
+
+// TestComponentLengthLimit tests individual component length limits
+func TestComponentLengthLimit(t *testing.T) {
+	workspace := t.TempDir()
+
+	// Create a component longer than 255 bytes
+	longComponent := strings.Repeat("a", 300)
+	path := filepath.Join("dir", longComponent, "file.txt")
+
+	err := ValidatePathForRead(path, workspace)
+	require.Error(t, err)
+	var valErr *ValidationError
+	require.ErrorAs(t, err, &valErr)
+	assert.Equal(t, ErrorInvalidPath, valErr.Type)
+	assert.Contains(t, valErr.Message, "exceeds 255 bytes")
 }

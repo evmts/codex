@@ -130,125 +130,31 @@ func sandboxTypeFromName(name string) SandboxType {
 // =============================================================================
 // macOS Seatbelt Implementation
 // =============================================================================
-
-type seatbeltSandbox struct{}
-
-func (s *seatbeltSandbox) Name() string {
-	return "seatbelt"
-}
-
-func (s *seatbeltSandbox) IsAvailable() bool {
-	return runtime.GOOS == "darwin"
-}
-
-func (s *seatbeltSandbox) Apply(cmd *exec.Cmd, policy *PolicyConfig, workspace string) error {
-	// On macOS, we would wrap the command with sandbox-exec
-	// For now, this is a placeholder that sets environment variables
-	// to indicate sandboxing is enabled.
-
-	// The actual implementation would use sandbox-exec with a custom profile
-	// similar to the Rust implementation in codex-rs/core/src/seatbelt.rs
-
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
-	}
-
-	cmd.Env = append(cmd.Env, "CODEX_SANDBOX=seatbelt")
-
-	if !policy.HasFullNetworkAccess() {
-		cmd.Env = append(cmd.Env, "CODEX_SANDBOX_NETWORK_DISABLED=1")
-	}
-
-	// TODO: Implement full Seatbelt profile generation and sandbox-exec wrapping
-	// This requires generating a sandbox profile similar to Rust implementation
-
-	return nil
-}
+// NOTE: Seatbelt implementation is in manager_seatbelt.go (macOS/darwin)
+// and manager_seatbelt_stub.go (non-macOS platforms) due to build tag requirements.
 
 // =============================================================================
 // Linux Landlock Implementation
 // =============================================================================
-
-type landlockSandbox struct{}
-
-func (l *landlockSandbox) Name() string {
-	return "landlock"
-}
-
-func (l *landlockSandbox) IsAvailable() bool {
-	if runtime.GOOS != "linux" {
-		return false
-	}
-
-	// Check if kernel version >= 5.13 (when Landlock was introduced)
-	version, err := getLinuxKernelVersion()
-	if err != nil {
-		return false
-	}
-
-	// Landlock was introduced in kernel 5.13
-	return version.Major > 5 || (version.Major == 5 && version.Minor >= 13)
-}
-
-func (l *landlockSandbox) Apply(cmd *exec.Cmd, policy *PolicyConfig, workspace string) error {
-	// Landlock implementation would use the landlock syscalls
-	// This is a placeholder that sets environment variables
-
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
-	}
-
-	cmd.Env = append(cmd.Env, "CODEX_SANDBOX=landlock")
-
-	if !policy.HasFullNetworkAccess() {
-		cmd.Env = append(cmd.Env, "CODEX_SANDBOX_NETWORK_DISABLED=1")
-	}
-
-	// TODO: Implement full Landlock support using landlock syscalls
-	// This requires using the landlock_create_ruleset, landlock_add_rule,
-	// and landlock_restrict_self syscalls similar to Rust implementation
-
-	return nil
-}
+// NOTE: Landlock implementation is in manager_landlock.go (Linux)
+// and manager_landlock_stub.go (non-Linux platforms) due to build tag requirements.
 
 // =============================================================================
 // Linux Seccomp Implementation
 // =============================================================================
-
-type seccompSandbox struct{}
-
-func (s *seccompSandbox) Name() string {
-	return "seccomp"
-}
-
-func (s *seccompSandbox) IsAvailable() bool {
-	return runtime.GOOS == "linux"
-}
-
-func (s *seccompSandbox) Apply(cmd *exec.Cmd, policy *PolicyConfig, workspace string) error {
-	// Seccomp implementation would use seccomp-bpf filters
-	// This is a placeholder that sets environment variables
-
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
-	}
-
-	cmd.Env = append(cmd.Env, "CODEX_SANDBOX=seccomp")
-
-	if !policy.HasFullNetworkAccess() {
-		cmd.Env = append(cmd.Env, "CODEX_SANDBOX_NETWORK_DISABLED=1")
-	}
-
-	// TODO: Implement full Seccomp-BPF support
-	// This requires setting up seccomp filters to restrict syscalls
-	// similar to the Rust implementation in codex-rs/linux-sandbox
-
-	return nil
-}
+// The seccompSandbox type and methods are implemented in:
+// - manager_linux.go (for Linux with full Seccomp-BPF support)
+// - manager_nonlinux.go (stub implementation for other platforms)
+//
+// This allows the same SandboxManager code to work across all platforms
+// with platform-specific sandbox implementations.
 
 // =============================================================================
 // Linux Kernel Version Detection
 // =============================================================================
+// NOTE: These functions are kept for testing purposes but are no longer used
+// for Landlock detection. Use landlock.IsSupported() instead, which tests
+// actual syscall availability rather than parsing kernel versions.
 
 type kernelVersion struct {
 	Major int
