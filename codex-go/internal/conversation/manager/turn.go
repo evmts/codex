@@ -82,10 +82,13 @@ func (tp *TurnProcessor) buildRequest(op *protocol.OpUserTurn) (*client.ChatComp
 	// Build messages from user input
 	var messages []client.Message
 
-	// Add system message if needed
-	// (In real implementation, this would come from history/context)
+	// Prepend reconstructed history if available (for resume scenarios)
+	reconstructedHistory := tp.session.GetReconstructedHistory()
+	if len(reconstructedHistory) > 0 {
+		messages = append(messages, reconstructedHistory...)
+	}
 
-	// Add user message
+	// Add user message from current turn
 	for _, item := range op.Items {
 		if item.Type == "text" && item.Text != nil {
 			messages = append(messages, client.NewUserMessage(*item.Text))
@@ -167,7 +170,11 @@ func (tp *TurnProcessor) processStream(ctx context.Context, submissionID string,
 
     // Multi-turn loop: continue as long as the model requests tools
     // Add a safety guard to avoid infinite loops
-    const maxTurns = 10
+    turnCtx := tp.session.GetTurnContext()
+    maxTurns := turnCtx.MaxTurns
+    if maxTurns <= 0 {
+        maxTurns = 10 // Default to 10 if not configured
+    }
     turns := 0
     for len(result.toolCalls) > 0 {
         turns++
@@ -181,6 +188,9 @@ func (tp *TurnProcessor) processStream(ctx context.Context, submissionID string,
 			ToolCalls: result.toolCalls,
 		}
 		conversationMessages = append(conversationMessages, assistantMsg)
+
+		// Compact conversation if nearing context window limit
+		conversationMessages = tp.compactConversationIfNeeded(conversationMessages)
 
 		// Execute tool calls and collect results
 		toolMessages, err := tp.executeToolCalls(ctx, submissionID, result.toolCalls)
@@ -626,6 +636,42 @@ func (tp *TurnProcessor) mapSandboxPolicy(p protocol.SandboxPolicy) runtime.Sand
     default:
         return runtime.SandboxDangerFullAccess
     }
+}
+
+// compactConversationIfNeeded truncates conversation history if it's nearing the context window limit.
+// This is a simple implementation that keeps the most recent messages.
+func (tp *TurnProcessor) compactConversationIfNeeded(messages []client.Message) []client.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	// Get context window limit from client
+	contextWindow := tp.session.client.GetModelContextWindow()
+	if contextWindow <= 0 {
+		return messages // No limit configured, return as-is
+	}
+
+	// Use a simple heuristic: assume average 3 tokens per message element
+	// and keep only the most recent messages if we exceed 80% of context window
+	estimatedTokens := int64(len(messages) * 3)
+	threshold := int64(float64(contextWindow) * 0.8)
+
+	if estimatedTokens < threshold {
+		return messages // Still within safe limit
+	}
+
+	// Calculate how many messages to keep (keep at least the last 5)
+	keepRatio := float64(threshold) / float64(estimatedTokens)
+	keepCount := int(float64(len(messages)) * keepRatio)
+	if keepCount < 5 && len(messages) > 5 {
+		keepCount = 5
+	}
+	if keepCount >= len(messages) {
+		return messages // No truncation needed
+	}
+
+	// Keep the most recent messages
+	return messages[len(messages)-keepCount:]
 }
 
 // ApprovalChecker determines if an operation needs user approval.

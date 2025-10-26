@@ -27,15 +27,16 @@ type Session struct {
     orch      *orchestrator.Orchestrator
 
     // Mutable fields (protected by mutex)
-    mu               sync.RWMutex
-    stateMachine     *StateMachine
-    currentTurnID    string
-    pendingApproval  *PendingApproval
-    approvalHandler  *SessionApprovalHandler
-    eventHandlers    []EventHandler
-    turnContext      *TurnContext
-    tokenUsage       *protocol.TokenUsage
-    lastAgentMessage string
+    mu                   sync.RWMutex
+    stateMachine         *StateMachine
+    currentTurnID        string
+    pendingApproval      *PendingApproval
+    approvalHandler      *SessionApprovalHandler
+    eventHandlers        []EventHandler
+    turnContext          *TurnContext
+    tokenUsage           *protocol.TokenUsage
+    lastAgentMessage     string
+    reconstructedHistory []client.Message // Messages from history reconstruction for resume
 
     // History persistence
     history          *persistence.HistoryPersistence
@@ -63,12 +64,14 @@ const (
 
 // TurnContext contains persistent context for turns in a session.
 type TurnContext struct {
-	Cwd            string
-	ApprovalPolicy string
-	SandboxPolicy  protocol.SandboxPolicy
-	Model          string
-	Effort         *string
-	Summary        string
+	Cwd              string
+	ApprovalPolicy   string
+	ApprovalTimeout  time.Duration // Timeout for approval requests (default 5 minutes)
+	SandboxPolicy    protocol.SandboxPolicy
+	Model            string
+	Effort           *string
+	Summary          string
+	MaxTurns         int           // Maximum multi-turn iterations (default 10, prevents infinite loops)
 }
 
 // EventHandler is called when events are emitted during turn processing.
@@ -187,14 +190,19 @@ func (s *Session) SubmitTurn(ctx context.Context, op *protocol.OpUserTurn) (stri
 	submissionID := fmt.Sprintf("turn_%s_%d", s.id, time.Now().UnixNano())
 	s.currentTurnID = submissionID
 
-	// Update turn context
+	// Update turn context, preserving MaxTurns and ApprovalTimeout if already set
+	maxTurns := s.turnContext.MaxTurns
+	approvalTimeout := s.turnContext.ApprovalTimeout
+
 	s.turnContext = &TurnContext{
-		Cwd:            op.Cwd,
-		ApprovalPolicy: op.ApprovalPolicy,
-		SandboxPolicy:  op.SandboxPolicy,
-		Model:          op.Model,
-		Effort:         op.Effort,
-		Summary:        op.Summary,
+		Cwd:             op.Cwd,
+		ApprovalPolicy:  op.ApprovalPolicy,
+		ApprovalTimeout: approvalTimeout,
+		SandboxPolicy:   op.SandboxPolicy,
+		Model:           op.Model,
+		Effort:          op.Effort,
+		Summary:         op.Summary,
+		MaxTurns:        maxTurns,
 	}
 
 	return submissionID, nil
@@ -467,4 +475,25 @@ func (s *Session) ClearApprovalHandler() {
     s.mu.Lock()
     defer s.mu.Unlock()
     s.approvalHandler = nil
+}
+
+// SetReconstructedHistory sets the conversation history from a reconstructed state.
+// This is used when resuming from persisted history.
+func (s *Session) SetReconstructedHistory(messages []client.Message) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.reconstructedHistory = messages
+}
+
+// GetReconstructedHistory returns the reconstructed conversation history.
+func (s *Session) GetReconstructedHistory() []client.Message {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    // Return a copy to prevent external modification
+    if s.reconstructedHistory == nil {
+        return nil
+    }
+    result := make([]client.Message, len(s.reconstructedHistory))
+    copy(result, s.reconstructedHistory)
+    return result
 }

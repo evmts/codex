@@ -106,13 +106,25 @@ func (h *SessionApprovalHandler) HandleApproval(ctx context.Context, req *runtim
 		return runtime.ApprovalDenied, fmt.Errorf("failed to emit approval event: %w", err)
 	}
 
-	// Wait for approval decision or context cancellation
+	// Set up timeout for approval
+	approvalTimeout := turnCtx.ApprovalTimeout
+	if approvalTimeout <= 0 {
+		approvalTimeout = 5 * time.Minute // Default to 5 minutes
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, approvalTimeout)
+	defer cancel()
+
+	// Wait for approval decision, timeout, or context cancellation
 	select {
-	case <-ctx.Done():
+	case <-timeoutCtx.Done():
 		h.mu.Lock()
 		delete(h.pendingReqs, req.CallID)
 		h.mu.Unlock()
-		return runtime.ApprovalDenied, ctx.Err()
+		// Check if it was a timeout or parent context cancellation
+		if ctx.Err() != nil {
+			return runtime.ApprovalDenied, ctx.Err()
+		}
+		return runtime.ApprovalDenied, fmt.Errorf("approval request timed out after %v", approvalTimeout)
 
 	case err := <-approvalReq.errChan:
 		h.mu.Lock()
