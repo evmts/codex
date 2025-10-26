@@ -246,6 +246,327 @@ func TestEventMsgSerialization(t *testing.T) {
 				"formatted_output": "output"
 			}`,
 		},
+		{
+			name: "AgentReasoningRawContent",
+			event: &EventAgentReasoningRawContent{
+				Text: "Raw reasoning content",
+			},
+			wantJSON: `{
+				"type": "agent_reasoning_raw_content",
+				"text": "Raw reasoning content"
+			}`,
+		},
+		{
+			name: "AgentReasoningRawContentDelta",
+			event: &EventAgentReasoningRawContentDelta{
+				Delta: "reasoning delta",
+			},
+			wantJSON: `{
+				"type": "agent_reasoning_raw_content_delta",
+				"delta": "reasoning delta"
+			}`,
+		},
+		{
+			name:  "AgentReasoningSectionBreak",
+			event: &EventAgentReasoningSectionBreak{},
+			wantJSON: `{
+				"type": "agent_reasoning_section_break"
+			}`,
+		},
+		{
+			name: "SessionConfigured",
+			event: &EventSessionConfigured{
+				SessionID:         "session-123",
+				Model:             "claude-3-5-sonnet-20241022",
+				HistoryLogID:      12345,
+				HistoryEntryCount: 10,
+				RolloutPath:       "/path/to/rollout",
+			},
+			wantJSON: `{
+				"type": "session_configured",
+				"session_id": "session-123",
+				"model": "claude-3-5-sonnet-20241022",
+				"history_log_id": 12345,
+				"history_entry_count": 10,
+				"rollout_path": "/path/to/rollout"
+			}`,
+		},
+		{
+			name: "McpToolCallBegin",
+			event: &EventMcpToolCallBegin{
+				CallID: "mcp-call-123",
+				Invocation: McpInvocation{
+					Server: "test-server",
+					Tool:   "test-tool",
+				},
+			},
+			wantJSON: `{
+				"type": "mcp_tool_call_begin",
+				"call_id": "mcp-call-123",
+				"invocation": {
+					"server": "test-server",
+					"tool": "test-tool"
+				}
+			}`,
+		},
+		{
+			name: "McpToolCallEnd",
+			event: &EventMcpToolCallEnd{
+				CallID: "mcp-call-123",
+				Invocation: McpInvocation{
+					Server: "test-server",
+					Tool:   "test-tool",
+				},
+				Duration: "2.5s",
+				Result:   map[string]interface{}{"status": "success"},
+			},
+			wantJSON: `{
+				"type": "mcp_tool_call_end",
+				"call_id": "mcp-call-123",
+				"invocation": {
+					"server": "test-server",
+					"tool": "test-tool"
+				},
+				"duration": "2.5s",
+				"result": {"status": "success"}
+			}`,
+		},
+		{
+			name: "WebSearchBegin",
+			event: &EventWebSearchBegin{
+				CallID: "search-123",
+			},
+			wantJSON: `{
+				"type": "web_search_begin",
+				"call_id": "search-123"
+			}`,
+		},
+		{
+			name: "WebSearchEnd",
+			event: &EventWebSearchEnd{
+				CallID: "search-123",
+				Query:  "golang best practices",
+			},
+			wantJSON: `{
+				"type": "web_search_end",
+				"call_id": "search-123",
+				"query": "golang best practices"
+			}`,
+		},
+		{
+			name: "ViewImageToolCall",
+			event: &EventViewImageToolCall{
+				CallID: "image-123",
+				Path:   "/path/to/image.png",
+			},
+			wantJSON: `{
+				"type": "view_image_tool_call",
+				"call_id": "image-123",
+				"path": "/path/to/image.png"
+			}`,
+		},
+		{
+			name: "BackgroundEvent",
+			event: &EventBackgroundEvent{
+				Message: "Background processing started",
+			},
+			wantJSON: `{
+				"type": "background_event",
+				"message": "Background processing started"
+			}`,
+		},
+		{
+			name: "ResourceListChanged",
+			event: &EventResourceListChanged{
+				ServerName: "test-server",
+			},
+			wantJSON: `{
+				"type": "resource_list_changed",
+				"server_name": "test-server"
+			}`,
+		},
+		{
+			name: "StreamError",
+			event: &EventStreamError{
+				Message: "Connection lost",
+			},
+			wantJSON: `{
+				"type": "stream_error",
+				"message": "Connection lost"
+			}`,
+		},
+		{
+			name: "PatchApplyBegin",
+			event: &EventPatchApplyBegin{
+				CallID:       "patch-123",
+				AutoApproved: true,
+				Changes:      map[string]interface{}{"file.go": "update"},
+			},
+			wantJSON: `{
+				"type": "patch_apply_begin",
+				"call_id": "patch-123",
+				"auto_approved": true,
+				"changes": {"file.go": "update"}
+			}`,
+		},
+		{
+			name: "PatchApplyEnd",
+			event: &EventPatchApplyEnd{
+				CallID:  "patch-123",
+				Stdout:  "Applied successfully",
+				Stderr:  "",
+				Success: true,
+			},
+			wantJSON: `{
+				"type": "patch_apply_end",
+				"call_id": "patch-123",
+				"stdout": "Applied successfully",
+				"stderr": "",
+				"success": true
+			}`,
+		},
+		{
+			name: "TurnDiff",
+			event: &EventTurnDiff{
+				UnifiedDiff: "diff --git a/file.go b/file.go\n...",
+			},
+			wantJSON: `{
+				"type": "turn_diff",
+				"unified_diff": "diff --git a/file.go b/file.go\n..."
+			}`,
+		},
+		{
+			name: "GetHistoryEntryResponse",
+			event: &EventGetHistoryEntryResponse{
+				Offset: 5,
+				LogID:  12345,
+				Entry:  map[string]string{"text": "history entry"},
+			},
+			wantJSON: `{
+				"type": "get_history_entry_response",
+				"offset": 5,
+				"log_id": 12345,
+				"entry": {"text": "history entry"}
+			}`,
+		},
+		{
+			name: "McpListToolsResponse",
+			event: &EventMcpListToolsResponse{
+				Tools:             map[string]interface{}{"tool1": "description"},
+				Resources:         map[string]interface{}{"res1": "data"},
+				ResourceTemplates: map[string]interface{}{"tmpl1": "template"},
+				AuthStatuses:      map[string]string{"server1": "authenticated"},
+			},
+			wantJSON: `{
+				"type": "mcp_list_tools_response",
+				"tools": {"tool1": "description"},
+				"resources": {"res1": "data"},
+				"resource_templates": {"tmpl1": "template"},
+				"auth_statuses": {"server1": "authenticated"}
+			}`,
+		},
+		{
+			name: "ListCustomPromptsResponse",
+			event: &EventListCustomPromptsResponse{
+				CustomPrompts: []interface{}{"prompt1", "prompt2"},
+			},
+			wantJSON: `{
+				"type": "list_custom_prompts_response",
+				"custom_prompts": ["prompt1", "prompt2"]
+			}`,
+		},
+		{
+			name: "PlanUpdate",
+			event: &EventPlanUpdate{
+				Plan: map[string]string{"step1": "complete"},
+			},
+			wantJSON: `{
+				"type": "plan_update",
+				"plan": {"step1": "complete"}
+			}`,
+		},
+		{
+			name: "TurnAborted",
+			event: &EventTurnAborted{
+				Reason: "interrupted",
+			},
+			wantJSON: `{
+				"type": "turn_aborted",
+				"reason": "interrupted"
+			}`,
+		},
+		{
+			name: "ConversationPath",
+			event: &EventConversationPath{
+				ConversationID: "conv-123",
+				Path:           "/path/to/conversation",
+			},
+			wantJSON: `{
+				"type": "conversation_path",
+				"conversation_id": "conv-123",
+				"path": "/path/to/conversation"
+			}`,
+		},
+		{
+			name: "EnteredReviewMode",
+			event: &EventEnteredReviewMode{
+				Prompt:         "Review this code",
+				UserFacingHint: "Starting code review",
+			},
+			wantJSON: `{
+				"type": "entered_review_mode",
+				"prompt": "Review this code",
+				"user_facing_hint": "Starting code review"
+			}`,
+		},
+		{
+			name: "ExitedReviewMode",
+			event: &EventExitedReviewMode{
+				ReviewOutput: map[string]string{"status": "completed"},
+			},
+			wantJSON: `{
+				"type": "exited_review_mode",
+				"review_output": {"status": "completed"}
+			}`,
+		},
+		{
+			name: "RawResponseItem",
+			event: &EventRawResponseItem{
+				Item: map[string]string{"type": "message"},
+			},
+			wantJSON: `{
+				"type": "raw_response_item",
+				"item": {"type": "message"}
+			}`,
+		},
+		{
+			name: "ItemStarted",
+			event: &EventItemStarted{
+				ThreadID: "thread-123",
+				TurnID:   "turn-456",
+				Item:     map[string]string{"name": "task"},
+			},
+			wantJSON: `{
+				"type": "item_started",
+				"thread_id": "thread-123",
+				"turn_id": "turn-456",
+				"item": {"name": "task"}
+			}`,
+		},
+		{
+			name: "ItemCompleted",
+			event: &EventItemCompleted{
+				ThreadID: "thread-123",
+				TurnID:   "turn-456",
+				Item:     map[string]string{"name": "task"},
+			},
+			wantJSON: `{
+				"type": "item_completed",
+				"thread_id": "thread-123",
+				"turn_id": "turn-456",
+				"item": {"name": "task"}
+			}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -307,6 +628,58 @@ func TestEventMsgSerialization(t *testing.T) {
 				unmarshaled = &EventExecCommandOutputDelta{}
 			case "exec_command_end":
 				unmarshaled = &EventExecCommandEnd{}
+			case "agent_reasoning_raw_content":
+				unmarshaled = &EventAgentReasoningRawContent{}
+			case "agent_reasoning_raw_content_delta":
+				unmarshaled = &EventAgentReasoningRawContentDelta{}
+			case "agent_reasoning_section_break":
+				unmarshaled = &EventAgentReasoningSectionBreak{}
+			case "session_configured":
+				unmarshaled = &EventSessionConfigured{}
+			case "mcp_tool_call_begin":
+				unmarshaled = &EventMcpToolCallBegin{}
+			case "mcp_tool_call_end":
+				unmarshaled = &EventMcpToolCallEnd{}
+			case "web_search_begin":
+				unmarshaled = &EventWebSearchBegin{}
+			case "web_search_end":
+				unmarshaled = &EventWebSearchEnd{}
+			case "view_image_tool_call":
+				unmarshaled = &EventViewImageToolCall{}
+			case "background_event":
+				unmarshaled = &EventBackgroundEvent{}
+			case "resource_list_changed":
+				unmarshaled = &EventResourceListChanged{}
+			case "stream_error":
+				unmarshaled = &EventStreamError{}
+			case "patch_apply_begin":
+				unmarshaled = &EventPatchApplyBegin{}
+			case "patch_apply_end":
+				unmarshaled = &EventPatchApplyEnd{}
+			case "turn_diff":
+				unmarshaled = &EventTurnDiff{}
+			case "get_history_entry_response":
+				unmarshaled = &EventGetHistoryEntryResponse{}
+			case "mcp_list_tools_response":
+				unmarshaled = &EventMcpListToolsResponse{}
+			case "list_custom_prompts_response":
+				unmarshaled = &EventListCustomPromptsResponse{}
+			case "plan_update":
+				unmarshaled = &EventPlanUpdate{}
+			case "turn_aborted":
+				unmarshaled = &EventTurnAborted{}
+			case "conversation_path":
+				unmarshaled = &EventConversationPath{}
+			case "entered_review_mode":
+				unmarshaled = &EventEnteredReviewMode{}
+			case "exited_review_mode":
+				unmarshaled = &EventExitedReviewMode{}
+			case "raw_response_item":
+				unmarshaled = &EventRawResponseItem{}
+			case "item_started":
+				unmarshaled = &EventItemStarted{}
+			case "item_completed":
+				unmarshaled = &EventItemCompleted{}
 			default:
 				t.Fatalf("Unknown event type: %s", typeCheck.Type)
 			}

@@ -569,96 +569,30 @@ func isShellOperator(token string) bool {
 }
 
 // IsKnownSafeCommand determines if a command is considered safe to execute
-// without approval or sandbox restrictions. This function now properly handles
-// shell-wrapped commands by parsing the actual commands from shell strings.
+// without approval or sandbox restrictions. This function now uses comprehensive
+// argument-aware validation via AnalyzeCommandSafety.
 //
 // For shell-wrapped commands (sh -c "..."), it extracts and validates all
-// commands in the shell string. If any command is not safe, returns false.
-//
-// TODO: Implement argument-aware validation to allow safe command usage
-// (e.g., allow "find . -name '*.txt'" but block "find . -delete")
+// commands in the shell string with full argument analysis.
 func IsKnownSafeCommand(command []string) bool {
-	if len(command) == 0 {
-		return false
-	}
+	// Use the comprehensive safety analysis
+	analysis := AnalyzeCommandSafety(command, "")
 
-	// List of commands that are generally safe (read-only operations)
-	// Note: "find" is NOT in this list because it has dangerous options:
-	// -delete, -exec, -ok, -execdir that can destroy data or execute arbitrary commands
-	safeCommands := map[string]bool{
-		"ls":     true,
-		"pwd":    true,
-		"echo":   true,
-		"cat":    true,
-		"grep":   true,
-		"which":  true,
-		"type":   true,
-		"head":   true,
-		"tail":   true,
-		"wc":     true,
-		"date":   true,
-		"whoami": true,
-		"id":     true,
-		"uname":  true,
-		"file":   true,
-		"stat":   true,
-	}
-
-	// Parse the command to extract actual programs
-	programs := parseShellCommand(command)
-
-	// All extracted commands must be safe
-	for _, program := range programs {
-		if !safeCommands[program] {
-			return false
-		}
-	}
-
-	// If we found at least one command and all were safe, return true
-	return len(programs) > 0
+	// Only return true if the command is always safe and doesn't require approval
+	return analysis.Level == SafetyAlwaysSafe && !analysis.RequiresApproval
 }
 
 // IsDangerousCommand determines if a command is potentially dangerous
-// and should always require approval. This function now properly handles
-// shell-wrapped commands by parsing the actual commands from shell strings.
+// and should always require approval. This function now uses comprehensive
+// argument-aware validation via AnalyzeCommandSafety.
 //
 // For shell-wrapped commands (sh -c "..."), it extracts and checks all
-// commands in the shell string. If any command is dangerous, returns true.
+// commands in the shell string with full argument analysis. Returns true
+// if the command requires approval due to dangerous flags or operations.
 func IsDangerousCommand(command []string) bool {
-	if len(command) == 0 {
-		return false
-	}
+	// Use the comprehensive safety analysis
+	analysis := AnalyzeCommandSafety(command, "")
 
-	// List of commands that are potentially dangerous
-	dangerousCommands := map[string]bool{
-		"rm":        true,
-		"rmdir":     true,
-		"dd":        true,
-		"mkfs":      true,
-		"fdisk":     true,
-		"parted":    true,
-		"sudo":      true,
-		"su":        true,
-		"chmod":     true,
-		"chown":     true,
-		"kill":      true,
-		"killall":   true,
-		"reboot":    true,
-		"shutdown":  true,
-		"halt":      true,
-		"init":      true,
-		"systemctl": true,
-	}
-
-	// Parse the command to extract actual programs
-	programs := parseShellCommand(command)
-
-	// Check if any extracted command is dangerous
-	for _, program := range programs {
-		if dangerousCommands[program] {
-			return true
-		}
-	}
-
-	return false
+	// Return true if the command requires approval (unsafe or high-risk conditional)
+	return analysis.RequiresApproval
 }

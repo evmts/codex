@@ -28,6 +28,7 @@ const (
 type Message struct {
 	Role      string
 	Content   string
+	Reasoning string    // Optional reasoning/thinking content from the model
 	Timestamp time.Time
 	ID        string
 }
@@ -52,14 +53,30 @@ type TokenUsage struct {
 	TotalTokens           int64
 }
 
+// SessionMetadata contains configuration and metadata about the session.
+type SessionMetadata struct {
+	SessionID        string
+	Model            string
+	Provider         string
+	ApprovalPolicy   string
+	SandboxMode      string
+	MaxTurns         int
+	ApprovalTimeout  time.Duration
+	ReasoningEffort  *string
+	HistoryLogID     uint64
+	HistoryEntryCount int
+}
+
 // ConversationState tracks the complete state of a conversation.
 // It is thread-safe and supports immutable snapshots.
 type ConversationState struct {
 	mu sync.RWMutex
 
-	messages   []Message
-	toolCalls  map[string]*ToolCall
-	tokenUsage []TokenUsage
+	messages        []Message
+	toolCalls       map[string]*ToolCall
+	tokenUsage      []TokenUsage
+	sessionMetadata *SessionMetadata
+	plan            interface{} // Current plan/todo list (map[string]interface{})
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -279,5 +296,59 @@ func (s *ConversationState) Clear() {
 	s.messages = make([]Message, 0)
 	s.toolCalls = make(map[string]*ToolCall)
 	s.tokenUsage = make([]TokenUsage, 0)
+	s.UpdatedAt = time.Now()
+}
+
+// SetSessionMetadata sets the session metadata.
+// This method is thread-safe.
+func (s *ConversationState) SetSessionMetadata(metadata *SessionMetadata) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sessionMetadata = metadata
+	s.UpdatedAt = time.Now()
+}
+
+// GetSessionMetadata returns a copy of the session metadata.
+// This method is thread-safe.
+func (s *ConversationState) GetSessionMetadata() *SessionMetadata {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.sessionMetadata == nil {
+		return nil
+	}
+
+	// Return a copy to prevent external modifications
+	metadata := *s.sessionMetadata
+	return &metadata
+}
+
+// UpdatePlan updates the current plan/todo list.
+// This method is thread-safe.
+func (s *ConversationState) UpdatePlan(plan interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.plan = plan
+	s.UpdatedAt = time.Now()
+}
+
+// GetPlan returns the current plan/todo list.
+// This method is thread-safe.
+func (s *ConversationState) GetPlan() interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.plan
+}
+
+// ClearPlan removes the current plan.
+// This method is thread-safe.
+func (s *ConversationState) ClearPlan() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.plan = nil
 	s.UpdatedAt = time.Now()
 }

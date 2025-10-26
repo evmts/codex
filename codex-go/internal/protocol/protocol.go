@@ -544,20 +544,23 @@ func (e *EventExecCommandBegin) MarshalJSON() ([]byte, error) {
 
 // EventExecCommandOutputDelta represents incremental output from a running command.
 // Chunk contains base64-encoded binary data to prevent corruption during JSON serialization.
+// IsBinary indicates whether the chunk contains binary data that was base64-encoded.
 type EventExecCommandOutputDelta struct {
-	CallID string `json:"call_id"`
-	Stream string `json:"stream"`
-	Chunk  string `json:"chunk"` // base64 encoded binary data
+	CallID   string `json:"call_id"`
+	Stream   string `json:"stream"`
+	Chunk    string `json:"chunk"`     // base64 encoded if binary, raw UTF-8 if text
+	IsBinary bool   `json:"is_binary"` // true if chunk is base64-encoded binary data
 }
 
 func (e *EventExecCommandOutputDelta) EventType() string { return "exec_command_output_delta" }
 func (e *EventExecCommandOutputDelta) isEventMsg()       {}
 func (e *EventExecCommandOutputDelta) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]interface{}{
-		"type":    "exec_command_output_delta",
-		"call_id": e.CallID,
-		"stream":  e.Stream,
-		"chunk":   e.Chunk,
+		"type":      "exec_command_output_delta",
+		"call_id":   e.CallID,
+		"stream":    e.Stream,
+		"chunk":     e.Chunk,
+		"is_binary": e.IsBinary,
 	})
 }
 
@@ -641,6 +644,559 @@ func (e *EventShutdownComplete) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]interface{}{
 		"type": "shutdown_complete",
 	})
+}
+
+// EventAgentReasoningRawContent represents raw chain-of-thought from the agent.
+type EventAgentReasoningRawContent struct {
+	Text string `json:"text"`
+}
+
+func (e *EventAgentReasoningRawContent) EventType() string { return "agent_reasoning_raw_content" }
+func (e *EventAgentReasoningRawContent) isEventMsg()       {}
+func (e *EventAgentReasoningRawContent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type": "agent_reasoning_raw_content",
+		"text": e.Text,
+	})
+}
+
+// EventAgentReasoningRawContentDelta represents a raw reasoning content delta from the agent.
+type EventAgentReasoningRawContentDelta struct {
+	Delta string `json:"delta"`
+}
+
+func (e *EventAgentReasoningRawContentDelta) EventType() string {
+	return "agent_reasoning_raw_content_delta"
+}
+func (e *EventAgentReasoningRawContentDelta) isEventMsg() {}
+func (e *EventAgentReasoningRawContentDelta) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":  "agent_reasoning_raw_content_delta",
+		"delta": e.Delta,
+	})
+}
+
+// EventAgentReasoningSectionBreak signals when the model begins a new reasoning summary section.
+type EventAgentReasoningSectionBreak struct{}
+
+func (e *EventAgentReasoningSectionBreak) EventType() string { return "agent_reasoning_section_break" }
+func (e *EventAgentReasoningSectionBreak) isEventMsg()       {}
+func (e *EventAgentReasoningSectionBreak) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type": "agent_reasoning_section_break",
+	})
+}
+
+// EventSessionConfigured acknowledges the client's configure message.
+type EventSessionConfigured struct {
+	SessionID         string   `json:"session_id"`
+	Model             string   `json:"model"`
+	ReasoningEffort   *string  `json:"reasoning_effort,omitempty"`
+	HistoryLogID      uint64   `json:"history_log_id"`
+	HistoryEntryCount int      `json:"history_entry_count"`
+	InitialMessages   []string `json:"initial_messages,omitempty"`
+	RolloutPath       string   `json:"rollout_path"`
+}
+
+func (e *EventSessionConfigured) EventType() string { return "session_configured" }
+func (e *EventSessionConfigured) isEventMsg()       {}
+func (e *EventSessionConfigured) MarshalJSON() ([]byte, error) {
+	m := map[string]interface{}{
+		"type":                "session_configured",
+		"session_id":          e.SessionID,
+		"model":               e.Model,
+		"history_log_id":      e.HistoryLogID,
+		"history_entry_count": e.HistoryEntryCount,
+		"rollout_path":        e.RolloutPath,
+	}
+	if e.ReasoningEffort != nil {
+		m["reasoning_effort"] = *e.ReasoningEffort
+	}
+	if len(e.InitialMessages) > 0 {
+		m["initial_messages"] = e.InitialMessages
+	}
+	return json.Marshal(m)
+}
+
+// McpInvocation represents an MCP tool invocation.
+type McpInvocation struct {
+	Server    string      `json:"server"`
+	Tool      string      `json:"tool"`
+	Arguments interface{} `json:"arguments,omitempty"`
+}
+
+// EventMcpToolCallBegin indicates the start of an MCP tool call.
+type EventMcpToolCallBegin struct {
+	CallID     string        `json:"call_id"`
+	Invocation McpInvocation `json:"invocation"`
+}
+
+func (e *EventMcpToolCallBegin) EventType() string { return "mcp_tool_call_begin" }
+func (e *EventMcpToolCallBegin) isEventMsg()       {}
+func (e *EventMcpToolCallBegin) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":       "mcp_tool_call_begin",
+		"call_id":    e.CallID,
+		"invocation": e.Invocation,
+	})
+}
+
+// EventMcpToolCallEnd indicates the completion of an MCP tool call.
+type EventMcpToolCallEnd struct {
+	CallID     string        `json:"call_id"`
+	Invocation McpInvocation `json:"invocation"`
+	Duration   string        `json:"duration"`
+	Result     interface{}   `json:"result"`
+}
+
+func (e *EventMcpToolCallEnd) EventType() string { return "mcp_tool_call_end" }
+func (e *EventMcpToolCallEnd) isEventMsg()       {}
+func (e *EventMcpToolCallEnd) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":       "mcp_tool_call_end",
+		"call_id":    e.CallID,
+		"invocation": e.Invocation,
+		"duration":   e.Duration,
+		"result":     e.Result,
+	})
+}
+
+// EventWebSearchBegin indicates the start of a web search operation.
+type EventWebSearchBegin struct {
+	CallID string `json:"call_id"`
+}
+
+func (e *EventWebSearchBegin) EventType() string { return "web_search_begin" }
+func (e *EventWebSearchBegin) isEventMsg()       {}
+func (e *EventWebSearchBegin) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":    "web_search_begin",
+		"call_id": e.CallID,
+	})
+}
+
+// EventWebSearchEnd indicates the completion of a web search operation.
+type EventWebSearchEnd struct {
+	CallID string `json:"call_id"`
+	Query  string `json:"query"`
+}
+
+func (e *EventWebSearchEnd) EventType() string { return "web_search_end" }
+func (e *EventWebSearchEnd) isEventMsg()       {}
+func (e *EventWebSearchEnd) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":    "web_search_end",
+		"call_id": e.CallID,
+		"query":   e.Query,
+	})
+}
+
+// EventViewImageToolCall indicates the agent attached a local image via view_image tool.
+type EventViewImageToolCall struct {
+	CallID string `json:"call_id"`
+	Path   string `json:"path"`
+}
+
+func (e *EventViewImageToolCall) EventType() string { return "view_image_tool_call" }
+func (e *EventViewImageToolCall) isEventMsg()       {}
+func (e *EventViewImageToolCall) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":    "view_image_tool_call",
+		"call_id": e.CallID,
+		"path":    e.Path,
+	})
+}
+
+// EventBackgroundEvent represents a background event message.
+type EventBackgroundEvent struct {
+	Message string `json:"message"`
+}
+
+func (e *EventBackgroundEvent) EventType() string { return "background_event" }
+func (e *EventBackgroundEvent) isEventMsg()       {}
+func (e *EventBackgroundEvent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":    "background_event",
+		"message": e.Message,
+	})
+}
+
+// EventResourceListChanged indicates that the list of resources has changed on an MCP server.
+type EventResourceListChanged struct {
+	ServerName string `json:"server_name"`
+}
+
+func (e *EventResourceListChanged) EventType() string { return "resource_list_changed" }
+func (e *EventResourceListChanged) isEventMsg()       {}
+func (e *EventResourceListChanged) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":        "resource_list_changed",
+		"server_name": e.ServerName,
+	})
+}
+
+// EventStreamError indicates a model stream error or disconnect.
+type EventStreamError struct {
+	Message string `json:"message"`
+}
+
+func (e *EventStreamError) EventType() string { return "stream_error" }
+func (e *EventStreamError) isEventMsg()       {}
+func (e *EventStreamError) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":    "stream_error",
+		"message": e.Message,
+	})
+}
+
+// EventPatchApplyBegin indicates the agent is about to apply a code patch.
+type EventPatchApplyBegin struct {
+	CallID       string                 `json:"call_id"`
+	AutoApproved bool                   `json:"auto_approved"`
+	Changes      map[string]interface{} `json:"changes"`
+}
+
+func (e *EventPatchApplyBegin) EventType() string { return "patch_apply_begin" }
+func (e *EventPatchApplyBegin) isEventMsg()       {}
+func (e *EventPatchApplyBegin) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":          "patch_apply_begin",
+		"call_id":       e.CallID,
+		"auto_approved": e.AutoApproved,
+		"changes":       e.Changes,
+	})
+}
+
+// EventPatchApplyEnd indicates that a patch application has finished.
+type EventPatchApplyEnd struct {
+	CallID  string `json:"call_id"`
+	Stdout  string `json:"stdout"`
+	Stderr  string `json:"stderr"`
+	Success bool   `json:"success"`
+}
+
+func (e *EventPatchApplyEnd) EventType() string { return "patch_apply_end" }
+func (e *EventPatchApplyEnd) isEventMsg()       {}
+func (e *EventPatchApplyEnd) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":    "patch_apply_end",
+		"call_id": e.CallID,
+		"stdout":  e.Stdout,
+		"stderr":  e.Stderr,
+		"success": e.Success,
+	})
+}
+
+// EventTurnDiff represents a unified diff for the turn.
+type EventTurnDiff struct {
+	UnifiedDiff string `json:"unified_diff"`
+}
+
+func (e *EventTurnDiff) EventType() string { return "turn_diff" }
+func (e *EventTurnDiff) isEventMsg()       {}
+func (e *EventTurnDiff) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":         "turn_diff",
+		"unified_diff": e.UnifiedDiff,
+	})
+}
+
+// EventGetHistoryEntryResponse is the response to GetHistoryEntryRequest.
+type EventGetHistoryEntryResponse struct {
+	Offset uint64      `json:"offset"`
+	LogID  uint64      `json:"log_id"`
+	Entry  interface{} `json:"entry,omitempty"`
+}
+
+func (e *EventGetHistoryEntryResponse) EventType() string { return "get_history_entry_response" }
+func (e *EventGetHistoryEntryResponse) isEventMsg()       {}
+func (e *EventGetHistoryEntryResponse) MarshalJSON() ([]byte, error) {
+	m := map[string]interface{}{
+		"type":   "get_history_entry_response",
+		"offset": e.Offset,
+		"log_id": e.LogID,
+	}
+	if e.Entry != nil {
+		m["entry"] = e.Entry
+	}
+	return json.Marshal(m)
+}
+
+// EventMcpListToolsResponse is the list of MCP tools available to the agent.
+type EventMcpListToolsResponse struct {
+	Tools             map[string]interface{} `json:"tools"`
+	Resources         map[string]interface{} `json:"resources"`
+	ResourceTemplates map[string]interface{} `json:"resource_templates"`
+	AuthStatuses      map[string]string      `json:"auth_statuses"`
+}
+
+func (e *EventMcpListToolsResponse) EventType() string { return "mcp_list_tools_response" }
+func (e *EventMcpListToolsResponse) isEventMsg()       {}
+func (e *EventMcpListToolsResponse) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":               "mcp_list_tools_response",
+		"tools":              e.Tools,
+		"resources":          e.Resources,
+		"resource_templates": e.ResourceTemplates,
+		"auth_statuses":      e.AuthStatuses,
+	})
+}
+
+// EventListCustomPromptsResponse is the list of custom prompts available to the agent.
+type EventListCustomPromptsResponse struct {
+	CustomPrompts []interface{} `json:"custom_prompts"`
+}
+
+func (e *EventListCustomPromptsResponse) EventType() string { return "list_custom_prompts_response" }
+func (e *EventListCustomPromptsResponse) isEventMsg()       {}
+func (e *EventListCustomPromptsResponse) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":           "list_custom_prompts_response",
+		"custom_prompts": e.CustomPrompts,
+	})
+}
+
+// EventPlanUpdate represents an update to the plan.
+type EventPlanUpdate struct {
+	Plan interface{} `json:"plan"`
+}
+
+func (e *EventPlanUpdate) EventType() string { return "plan_update" }
+func (e *EventPlanUpdate) isEventMsg()       {}
+func (e *EventPlanUpdate) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type": "plan_update",
+		"plan": e.Plan,
+	})
+}
+
+// EventTurnAborted indicates a turn was aborted.
+type EventTurnAborted struct {
+	Reason string `json:"reason"`
+}
+
+func (e *EventTurnAborted) EventType() string { return "turn_aborted" }
+func (e *EventTurnAborted) isEventMsg()       {}
+func (e *EventTurnAborted) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":   "turn_aborted",
+		"reason": e.Reason,
+	})
+}
+
+// EventConversationPath is the response containing the current session's in-memory transcript.
+type EventConversationPath struct {
+	ConversationID string `json:"conversation_id"`
+	Path           string `json:"path"`
+}
+
+func (e *EventConversationPath) EventType() string { return "conversation_path" }
+func (e *EventConversationPath) isEventMsg()       {}
+func (e *EventConversationPath) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":            "conversation_path",
+		"conversation_id": e.ConversationID,
+		"path":            e.Path,
+	})
+}
+
+// EventEnteredReviewMode indicates the agent entered review mode.
+type EventEnteredReviewMode struct {
+	Prompt         string `json:"prompt"`
+	UserFacingHint string `json:"user_facing_hint"`
+}
+
+func (e *EventEnteredReviewMode) EventType() string { return "entered_review_mode" }
+func (e *EventEnteredReviewMode) isEventMsg()       {}
+func (e *EventEnteredReviewMode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":             "entered_review_mode",
+		"prompt":           e.Prompt,
+		"user_facing_hint": e.UserFacingHint,
+	})
+}
+
+// EventExitedReviewMode indicates the agent exited review mode.
+type EventExitedReviewMode struct {
+	ReviewOutput interface{} `json:"review_output,omitempty"`
+}
+
+func (e *EventExitedReviewMode) EventType() string { return "exited_review_mode" }
+func (e *EventExitedReviewMode) isEventMsg()       {}
+func (e *EventExitedReviewMode) MarshalJSON() ([]byte, error) {
+	m := map[string]interface{}{
+		"type": "exited_review_mode",
+	}
+	if e.ReviewOutput != nil {
+		m["review_output"] = e.ReviewOutput
+	}
+	return json.Marshal(m)
+}
+
+// EventRawResponseItem represents a raw response item.
+type EventRawResponseItem struct {
+	Item interface{} `json:"item"`
+}
+
+func (e *EventRawResponseItem) EventType() string { return "raw_response_item" }
+func (e *EventRawResponseItem) isEventMsg()       {}
+func (e *EventRawResponseItem) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type": "raw_response_item",
+		"item": e.Item,
+	})
+}
+
+// EventItemStarted indicates an item has started.
+type EventItemStarted struct {
+	ThreadID string      `json:"thread_id"`
+	TurnID   string      `json:"turn_id"`
+	Item     interface{} `json:"item"`
+}
+
+func (e *EventItemStarted) EventType() string { return "item_started" }
+func (e *EventItemStarted) isEventMsg()       {}
+func (e *EventItemStarted) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":      "item_started",
+		"thread_id": e.ThreadID,
+		"turn_id":   e.TurnID,
+		"item":      e.Item,
+	})
+}
+
+// EventItemCompleted indicates an item has completed.
+type EventItemCompleted struct {
+	ThreadID string      `json:"thread_id"`
+	TurnID   string      `json:"turn_id"`
+	Item     interface{} `json:"item"`
+}
+
+func (e *EventItemCompleted) EventType() string { return "item_completed" }
+func (e *EventItemCompleted) isEventMsg()       {}
+func (e *EventItemCompleted) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type":      "item_completed",
+		"thread_id": e.ThreadID,
+		"turn_id":   e.TurnID,
+		"item":      e.Item,
+	})
+}
+
+// EventSandboxViolation reports a sandbox policy violation.
+type EventSandboxViolation struct {
+	CallID       string  `json:"call_id"`
+	SandboxType  string  `json:"sandbox_type"`
+	Operation    string  `json:"operation"`
+	Path         *string `json:"path,omitempty"`
+	Syscall      *string `json:"syscall,omitempty"`
+	ErrorMessage string  `json:"error_message"`
+	ExitCode     int     `json:"exit_code"`
+	Timestamp    string  `json:"timestamp"`
+}
+
+func (e *EventSandboxViolation) EventType() string { return "sandbox_violation" }
+func (e *EventSandboxViolation) isEventMsg()       {}
+func (e *EventSandboxViolation) MarshalJSON() ([]byte, error) {
+	m := map[string]interface{}{
+		"type":          "sandbox_violation",
+		"call_id":       e.CallID,
+		"sandbox_type":  e.SandboxType,
+		"operation":     e.Operation,
+		"error_message": e.ErrorMessage,
+		"exit_code":     e.ExitCode,
+		"timestamp":     e.Timestamp,
+	}
+	if e.Path != nil {
+		m["path"] = *e.Path
+	}
+	if e.Syscall != nil {
+		m["syscall"] = *e.Syscall
+	}
+	return json.Marshal(m)
+}
+
+// EventOperationStarted indicates a long-running operation has started.
+type EventOperationStarted struct {
+	Operation         string  `json:"operation"`
+	EstimatedDuration *int64  `json:"estimated_duration_ms,omitempty"`
+	Total             *int64  `json:"total,omitempty"`
+	Message           string  `json:"message,omitempty"`
+}
+
+func (e *EventOperationStarted) EventType() string { return "operation_started" }
+func (e *EventOperationStarted) isEventMsg()       {}
+func (e *EventOperationStarted) MarshalJSON() ([]byte, error) {
+	m := map[string]interface{}{
+		"type":      "operation_started",
+		"operation": e.Operation,
+	}
+	if e.EstimatedDuration != nil {
+		m["estimated_duration_ms"] = *e.EstimatedDuration
+	}
+	if e.Total != nil {
+		m["total"] = *e.Total
+	}
+	if e.Message != "" {
+		m["message"] = e.Message
+	}
+	return json.Marshal(m)
+}
+
+// EventOperationProgress reports progress for a long-running operation.
+type EventOperationProgress struct {
+	Operation  string   `json:"operation"`
+	Current    int64    `json:"current"`
+	Total      *int64   `json:"total,omitempty"`
+	Percentage *float64 `json:"percentage,omitempty"`
+	Message    string   `json:"message,omitempty"`
+}
+
+func (e *EventOperationProgress) EventType() string { return "operation_progress" }
+func (e *EventOperationProgress) isEventMsg()       {}
+func (e *EventOperationProgress) MarshalJSON() ([]byte, error) {
+	m := map[string]interface{}{
+		"type":      "operation_progress",
+		"operation": e.Operation,
+		"current":   e.Current,
+	}
+	if e.Total != nil {
+		m["total"] = *e.Total
+	}
+	if e.Percentage != nil {
+		m["percentage"] = *e.Percentage
+	}
+	if e.Message != "" {
+		m["message"] = e.Message
+	}
+	return json.Marshal(m)
+}
+
+// EventOperationCompleted indicates a long-running operation has finished.
+type EventOperationCompleted struct {
+	Operation      string  `json:"operation"`
+	DurationMs     int64   `json:"duration_ms"`
+	Status         string  `json:"status"`
+	Message        string  `json:"message,omitempty"`
+	ProcessedCount *int64  `json:"processed_count,omitempty"`
+}
+
+func (e *EventOperationCompleted) EventType() string { return "operation_completed" }
+func (e *EventOperationCompleted) isEventMsg()       {}
+func (e *EventOperationCompleted) MarshalJSON() ([]byte, error) {
+	m := map[string]interface{}{
+		"type":        "operation_completed",
+		"operation":   e.Operation,
+		"duration_ms": e.DurationMs,
+		"status":      e.Status,
+	}
+	if e.Message != "" {
+		m["message"] = e.Message
+	}
+	if e.ProcessedCount != nil {
+		m["processed_count"] = *e.ProcessedCount
+	}
+	return json.Marshal(m)
 }
 
 // UnmarshalJSON implements custom unmarshaling for Event
@@ -753,6 +1309,182 @@ func unmarshalEventMsg(eventType string, data []byte) (EventMsg, error) {
 		return &evt, nil
 	case "shutdown_complete":
 		return &EventShutdownComplete{}, nil
+	case "agent_reasoning_raw_content":
+		var evt EventAgentReasoningRawContent
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "agent_reasoning_raw_content_delta":
+		var evt EventAgentReasoningRawContentDelta
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "agent_reasoning_section_break":
+		return &EventAgentReasoningSectionBreak{}, nil
+	case "session_configured":
+		var evt EventSessionConfigured
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "mcp_tool_call_begin":
+		var evt EventMcpToolCallBegin
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "mcp_tool_call_end":
+		var evt EventMcpToolCallEnd
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "web_search_begin":
+		var evt EventWebSearchBegin
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "web_search_end":
+		var evt EventWebSearchEnd
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "view_image_tool_call":
+		var evt EventViewImageToolCall
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "background_event":
+		var evt EventBackgroundEvent
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "resource_list_changed":
+		var evt EventResourceListChanged
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "stream_error":
+		var evt EventStreamError
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "patch_apply_begin":
+		var evt EventPatchApplyBegin
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "patch_apply_end":
+		var evt EventPatchApplyEnd
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "turn_diff":
+		var evt EventTurnDiff
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "get_history_entry_response":
+		var evt EventGetHistoryEntryResponse
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "mcp_list_tools_response":
+		var evt EventMcpListToolsResponse
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "list_custom_prompts_response":
+		var evt EventListCustomPromptsResponse
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "plan_update":
+		var evt EventPlanUpdate
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "turn_aborted":
+		var evt EventTurnAborted
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "conversation_path":
+		var evt EventConversationPath
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "entered_review_mode":
+		var evt EventEnteredReviewMode
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "exited_review_mode":
+		var evt EventExitedReviewMode
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "raw_response_item":
+		var evt EventRawResponseItem
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "item_started":
+		var evt EventItemStarted
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "item_completed":
+		var evt EventItemCompleted
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "sandbox_violation":
+		var evt EventSandboxViolation
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "operation_started":
+		var evt EventOperationStarted
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "operation_progress":
+		var evt EventOperationProgress
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
+	case "operation_completed":
+		var evt EventOperationCompleted
+		if err := json.Unmarshal(data, &evt); err != nil {
+			return nil, err
+		}
+		return &evt, nil
 	default:
 		return nil, fmt.Errorf("unknown event type: %s", eventType)
 	}

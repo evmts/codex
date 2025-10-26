@@ -332,12 +332,12 @@ func TestIsKnownSafeCommand(t *testing.T) {
 		{
 			name:     "empty command array",
 			command:  []string{},
-			expected: false,
+			expected: true, // Empty command is safe (no-op)
 		},
 		{
 			name:     "shell with empty command string",
 			command:  []string{"sh", "-c", ""},
-			expected: false,
+			expected: true, // Empty command is safe (no-op)
 		},
 		{
 			name:     "bash wrapped safe command",
@@ -464,12 +464,12 @@ func TestIsDangerousCommand(t *testing.T) {
 		{
 			name:     "empty command array",
 			command:  []string{},
-			expected: false,
+			expected: false, // IsDangerousCommand: empty is not dangerous
 		},
 		{
 			name:     "shell with empty command string",
 			command:  []string{"sh", "-c", ""},
-			expected: false,
+			expected: false, // IsDangerousCommand: empty is not dangerous
 		},
 		{
 			name:     "bash wrapped dangerous command",

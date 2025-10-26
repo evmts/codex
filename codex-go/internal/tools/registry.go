@@ -4,8 +4,12 @@ package tools
 
 import (
 	"github.com/evmts/codex/codex-go/internal/tools/file"
+	"github.com/evmts/codex/codex-go/internal/tools/git"
+	"github.com/evmts/codex/codex-go/internal/tools/image"
+	"github.com/evmts/codex/codex-go/internal/tools/plan"
 	"github.com/evmts/codex/codex-go/internal/tools/runtime"
 	"github.com/evmts/codex/codex-go/internal/tools/shell"
+	"github.com/evmts/codex/codex-go/internal/tools/websearch"
 	"github.com/spf13/afero"
 )
 
@@ -16,6 +20,13 @@ import (
 //   - write_file: Write file contents
 //   - list_dir: List directory contents
 //   - grep_files: Search files with regex patterns
+//   - view_image: View and attach images to conversation
+//   - update_plan: Update task/todo list
+//   - web_search: Perform web searches (if enabled)
+//   - git_status: Show git working tree status
+//   - git_diff: Show changes between commits and working tree
+//   - git_log: Show commit history
+//   - git_commit: Record changes to the repository
 func NewDefaultRegistry() *runtime.ToolRegistry {
 	registry := runtime.NewToolRegistry()
 
@@ -30,6 +41,39 @@ func NewDefaultRegistry() *runtime.ToolRegistry {
 	registry.Register(file.NewWriteTool(fs))
 	registry.Register(file.NewListTool(fs))
 	registry.Register(file.NewGrepTool(fs))
+
+	// Register image tool
+	registry.Register(image.NewImageTool())
+
+	// Register plan tool (without event emitter for basic registry)
+	// Sessions can replace this with an event-emitting version if needed
+	registry.Register(plan.NewBasicUpdatePlanTool())
+
+	// Register git tools
+	registry.Register(git.NewStatusTool())
+	registry.Register(git.NewDiffTool())
+	registry.Register(git.NewLogTool())
+	registry.Register(git.NewCommitTool())
+
+	return registry
+}
+
+// NewDefaultRegistryWithWebSearch creates a registry with web search enabled.
+// provider: The search provider to use (e.g., "duckduckgo")
+func NewDefaultRegistryWithWebSearch(provider string) *runtime.ToolRegistry {
+	registry := NewDefaultRegistry()
+
+	// Add web search tool based on provider
+	var searchProvider websearch.Provider
+	switch provider {
+	case "duckduckgo", "":
+		searchProvider = websearch.NewDuckDuckGoProvider()
+	default:
+		// Default to DuckDuckGo if unknown provider
+		searchProvider = websearch.NewDuckDuckGoProvider()
+	}
+
+	registry.Register(websearch.NewWebSearchTool(searchProvider))
 
 	return registry
 }

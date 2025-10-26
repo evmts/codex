@@ -100,9 +100,7 @@ func (m *SearchManager) executeSearch() {
 
 	// Clean up
 	m.mu.Lock()
-	if m.cancelSearch == cancel {
-		m.cancelSearch = nil
-	}
+	m.cancelSearch = nil
 	m.mu.Unlock()
 }
 

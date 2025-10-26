@@ -72,26 +72,44 @@ func NewModel(mgr manager.ConversationManager) Model {
 	ti.CharLimit = 500
 	ti.Width = 80
 
+	// Get working directory for file search
+	workingDir, _ := os.Getwd()
+
+	// Initialize file search components
+	fileSearchResultCh := make(chan filesearch.SearchResultMsg, 10)
+
+	// Create searcher with default options
+	searcher, _ := filesearch.NewSearcher(workingDir, filesearch.DefaultSearchOptions())
+
+	// Create search manager
+	searchManager := filesearch.NewSearchManager(searcher, fileSearchResultCh)
+
 	return Model{
-		viewMode:         ViewModeSessionList,
-		conversationMgr:  mgr,
-		keys:             DefaultKeyMap(),
-		sessions:         []string{},
-		selectedIdx:      0,
-		messages:         []Message{},
-		inputText:        ti,
-		model:            "claude-3-5-sonnet-20241022",
-		totalTokens:      0,
-		width:            80,
-		height:           24,
-		toolApprovalChan: make(chan bool, 1),
-		eventChan:        make(chan *protocol.Event, 100),
+		viewMode:            ViewModeSessionList,
+		conversationMgr:     mgr,
+		keys:                DefaultKeyMap(),
+		sessions:            []string{},
+		selectedIdx:         0,
+		messages:            []Message{},
+		inputText:           ti,
+		model:               "claude-3-5-sonnet-20241022",
+		totalTokens:         0,
+		width:               80,
+		height:              24,
+		toolApprovalChan:    make(chan bool, 1),
+		eventChan:           make(chan *protocol.Event, 100),
+		fileSearchPopup:     nil, // Created on demand
+		fileSearchManager:   searchManager,
+		fileSearchResultCh:  fileSearchResultCh,
+		workingDir:          workingDir,
+		activeAtToken:       "",
+		dismissedAtToken:    "",
 	}
 }
 
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, m.loadSessions(), m.waitForEvent())
+	return tea.Batch(textinput.Blink, m.loadSessions(), m.waitForEvent(), m.waitForFileSearchResult())
 }
 
 // Update handles messages and updates the model
@@ -175,7 +193,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputText.Focus() // Re-enable input on error
 		return m, m.waitForEvent()
 
+	case fileSearchResultMsg:
+		// Update file search popup with results
+		if m.fileSearchPopup != nil {
+			m.fileSearchPopup.SetMatches(msg.query, msg.matches)
+		}
+		// Continue polling for more results
+		return m, m.waitForFileSearchResult()
+
 	case tea.KeyMsg:
+		// Handle file search popup keys first
+		if m.fileSearchPopup != nil && m.viewMode == ViewModeConversation {
+			switch msg.String() {
+			case "up":
+				m.fileSearchPopup.MoveUp()
+				return m, nil
+
+			case "down":
+				m.fileSearchPopup.MoveDown()
+				return m, nil
+
+			case "tab":
+				// Select file from popup
+				selectedPath := m.fileSearchPopup.SelectedMatch()
+				if selectedPath != "" {
+					m.insertFileReference(selectedPath)
+					m.fileSearchPopup = nil
+					m.activeAtToken = ""
+					m.dismissedAtToken = ""
+				}
+				return m, nil
+
+			case "enter":
+				// Check if we have a selection in popup
+				if m.fileSearchPopup.HasMatches() {
+					selectedPath := m.fileSearchPopup.SelectedMatch()
+					if selectedPath != "" {
+						m.insertFileReference(selectedPath)
+						m.fileSearchPopup = nil
+						m.activeAtToken = ""
+						m.dismissedAtToken = ""
+						return m, nil
+					}
+				}
+				// If no selection, fall through to normal enter handling
+
+			case "esc":
+				// Dismiss popup and remember this token
+				m.dismissedAtToken = m.activeAtToken
+				m.fileSearchPopup = nil
+				m.activeAtToken = ""
+				return m, nil
+			}
+		}
+
+		// Normal key handling
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if m.viewMode == ViewModeSessionList || m.pendingTool == nil {
@@ -256,7 +328,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Update text input if in conversation mode
 	if m.viewMode == ViewModeConversation && m.pendingTool == nil {
+		oldValue := m.inputText.Value()
 		m.inputText, cmd = m.inputText.Update(msg)
+		newValue := m.inputText.Value()
+
+		// Check if input changed and sync file search popup
+		if oldValue != newValue {
+			m.syncFileSearchPopup()
+		}
+
 		return m, cmd
 	}
 
@@ -301,6 +381,11 @@ func (m Model) View() string {
 	// Add error if present
 	if m.err != nil {
 		content += "\n\n" + RenderError(m.err)
+	}
+
+	// Overlay file search popup if active
+	if m.fileSearchPopup != nil && m.viewMode == ViewModeConversation {
+		content += "\n\n" + m.fileSearchPopup.Render()
 	}
 
 	// Add status bar
@@ -473,6 +558,76 @@ func (m *Model) denyTool() {
 	}
 }
 
+// syncFileSearchPopup detects @ tokens and updates the file search popup
+func (m *Model) syncFileSearchPopup() {
+	inputValue := m.inputText.Value()
+	cursorPos := m.inputText.Position()
+
+	// Get current @ token at cursor
+	token, _, hasAt := input.GetCurrentToken(inputValue, cursorPos)
+
+	if !hasAt || token == "" {
+		// No @ token, close popup if open
+		if m.fileSearchPopup != nil {
+			m.fileSearchPopup = nil
+			m.activeAtToken = ""
+		}
+		return
+	}
+
+	// Check if this is the dismissed token
+	if token == m.dismissedAtToken {
+		return
+	}
+
+	// Create popup if it doesn't exist
+	if m.fileSearchPopup == nil {
+		m.fileSearchPopup = NewFileSearchPopup()
+	}
+
+	// If token changed, trigger search
+	if token != m.activeAtToken {
+		m.activeAtToken = token
+		m.fileSearchPopup.SetQuery(token)
+
+		// Trigger debounced search
+		if m.fileSearchManager != nil {
+			m.fileSearchManager.OnUserQuery(token)
+		}
+	}
+}
+
+// insertFileReference inserts a file path at the current @ token position
+func (m *Model) insertFileReference(path string) {
+	inputValue := m.inputText.Value()
+	cursorPos := m.inputText.Position()
+
+	// Get current @ token at cursor
+	token, atPos, hasAt := input.GetCurrentToken(inputValue, cursorPos)
+	if !hasAt {
+		return
+	}
+
+	// Calculate the end position of the @ token
+	tokenEnd := atPos + 1 + len(token) // @ + token length
+
+	// Quote path if it contains spaces
+	displayPath := path
+	if strings.Contains(path, " ") {
+		displayPath = `"` + path + `"`
+	}
+
+	// Build new input value
+	newValue := inputValue[:atPos] + "@" + displayPath + inputValue[tokenEnd:]
+
+	// Update input
+	m.inputText.SetValue(newValue)
+
+	// Set cursor after the inserted path
+	newCursorPos := atPos + 1 + len(displayPath)
+	m.inputText.SetCursor(newCursorPos)
+}
+
 // Message types for tea.Msg
 
 type sessionsLoadedMsg struct {
@@ -547,6 +702,12 @@ type errorMsg struct {
 	err error
 }
 
+type fileSearchResultMsg struct {
+	query   string
+	matches []filesearch.FileMatch
+	err     error
+}
+
 // Commands
 
 func (m *Model) loadSessions() tea.Cmd {
@@ -565,6 +726,22 @@ func (m *Model) waitForEvent() tea.Cmd {
 			return nil
 		}
 		return convertEventToMsg(event)
+	}
+}
+
+// waitForFileSearchResult polls the file search result channel
+func (m *Model) waitForFileSearchResult() tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case result := <-m.fileSearchResultCh:
+			return fileSearchResultMsg{
+				query:   result.Query,
+				matches: result.Matches,
+				err:     result.Error,
+			}
+		default:
+			return nil
+		}
 	}
 }
 

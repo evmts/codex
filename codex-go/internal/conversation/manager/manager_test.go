@@ -491,6 +491,142 @@ func TestApprovalChecker(t *testing.T) {
 	})
 }
 
+func TestSessionConfigurationEvent(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mocks.NewMockClient(ctrl)
+
+	t.Run("emits EventSessionConfigured on session creation", func(t *testing.T) {
+		// Track emitted events
+		var emittedEvents []*protocol.Event
+		eventHandler := func(ctx context.Context, event *protocol.Event) error {
+			emittedEvents = append(emittedEvents, event)
+			return nil
+		}
+
+		mgr := createTestManager(t, mockClient)
+		ctx := context.Background()
+
+		cfg := SessionConfig{
+			ID:       "session-1",
+			Provider: "anthropic",
+			TurnContext: &TurnContext{
+				Cwd:            "/test",
+				Model:          "claude-3-5-sonnet-20241022",
+				ApprovalPolicy: "auto",
+				SandboxPolicy:  protocol.SandboxPolicy{Mode: "native"},
+				MaxTurns:       10,
+				Summary:        "off",
+			},
+			EventHandlers: []EventHandler{eventHandler},
+		}
+
+		session, err := mgr.CreateSession(ctx, cfg)
+		require.NoError(t, err)
+		require.NotNil(t, session)
+
+		// Verify EventSessionConfigured was emitted
+		require.Len(t, emittedEvents, 1)
+		event := emittedEvents[0]
+		require.NotNil(t, event.Msg)
+
+		configEvent, ok := event.Msg.(*protocol.EventSessionConfigured)
+		require.True(t, ok, "expected EventSessionConfigured")
+		assert.Equal(t, "session-1", configEvent.SessionID)
+		assert.Equal(t, "claude-3-5-sonnet-20241022", configEvent.Model)
+		assert.Nil(t, configEvent.ReasoningEffort)
+	})
+
+	t.Run("emits EventSessionConfigured with reasoning effort", func(t *testing.T) {
+		// Track emitted events
+		var emittedEvents []*protocol.Event
+		eventHandler := func(ctx context.Context, event *protocol.Event) error {
+			emittedEvents = append(emittedEvents, event)
+			return nil
+		}
+
+		mgr := createTestManager(t, mockClient)
+		ctx := context.Background()
+
+		effort := "high"
+		cfg := SessionConfig{
+			ID:       "session-2",
+			Provider: "anthropic",
+			TurnContext: &TurnContext{
+				Cwd:            "/test",
+				Model:          "claude-3-7-sonnet-20250219",
+				ApprovalPolicy: "auto",
+				Effort:         &effort,
+				Summary:        "auto",
+			},
+			EventHandlers: []EventHandler{eventHandler},
+		}
+
+		session, err := mgr.CreateSession(ctx, cfg)
+		require.NoError(t, err)
+		require.NotNil(t, session)
+
+		// Verify EventSessionConfigured was emitted with reasoning effort
+		require.Len(t, emittedEvents, 1)
+		event := emittedEvents[0]
+
+		configEvent, ok := event.Msg.(*protocol.EventSessionConfigured)
+		require.True(t, ok, "expected EventSessionConfigured")
+		assert.Equal(t, "session-2", configEvent.SessionID)
+		assert.Equal(t, "claude-3-7-sonnet-20250219", configEvent.Model)
+		require.NotNil(t, configEvent.ReasoningEffort)
+		assert.Equal(t, "high", *configEvent.ReasoningEffort)
+	})
+
+	t.Run("session stores history metadata", func(t *testing.T) {
+		mgr := createTestManager(t, mockClient)
+		ctx := context.Background()
+
+		cfg := SessionConfig{
+			ID: "session-3",
+			TurnContext: &TurnContext{
+				Cwd:            "/test",
+				Model:          "gpt-4",
+				ApprovalPolicy: "manual",
+			},
+		}
+
+		session, err := mgr.CreateSession(ctx, cfg)
+		require.NoError(t, err)
+
+		// Set history metadata
+		session.SetHistoryMetadata(12345, 42)
+
+		// Verify metadata is stored
+		logID, entryCount := session.GetHistoryMetadata()
+		assert.Equal(t, uint64(12345), logID)
+		assert.Equal(t, 42, entryCount)
+	})
+
+	t.Run("session captures provider information", func(t *testing.T) {
+		mgr := createTestManager(t, mockClient)
+		ctx := context.Background()
+
+		cfg := SessionConfig{
+			ID:       "session-4",
+			Provider: "openai",
+			TurnContext: &TurnContext{
+				Cwd:            "/test",
+				Model:          "gpt-4-turbo",
+				ApprovalPolicy: "semi-auto",
+			},
+		}
+
+		session, err := mgr.CreateSession(ctx, cfg)
+		require.NoError(t, err)
+		require.NotNil(t, session)
+
+		// Provider is stored in session (internal field)
+		assert.Equal(t, "session-4", session.ID())
+	})
+}
+
 // Helper functions
 
 func createTestManager(t *testing.T, mockClient *mocks.MockClient) ConversationManager {

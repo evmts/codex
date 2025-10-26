@@ -1,56 +1,63 @@
 package manager
 
 import (
-    "context"
-    "fmt"
-    "path/filepath"
-    "sync"
-    "time"
+	"context"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"time"
 
-    "github.com/evmts/codex/codex-go/internal/client"
-    "github.com/evmts/codex/codex-go/internal/history/persistence"
-    "github.com/evmts/codex/codex-go/internal/protocol"
-    "github.com/evmts/codex/codex-go/internal/tools/orchestrator"
-    "github.com/evmts/codex/codex-go/internal/tools/runtime"
-    "github.com/spf13/afero"
+	"github.com/evmts/codex/codex-go/internal/client"
+	"github.com/evmts/codex/codex-go/internal/config"
+	"github.com/evmts/codex/codex-go/internal/history/persistence"
+	"github.com/evmts/codex/codex-go/internal/models"
+	"github.com/evmts/codex/codex-go/internal/notify"
+	"github.com/evmts/codex/codex-go/internal/protocol"
+	"github.com/evmts/codex/codex-go/internal/tools/orchestrator"
+	"github.com/evmts/codex/codex-go/internal/tools/runtime"
+	"github.com/spf13/afero"
 )
 
 // ConversationManager is the main interface for managing conversation sessions.
 // It coordinates session lifecycle, turn processing, and event handling.
 type ConversationManager interface {
-    // CreateSession creates a new conversation session
-    CreateSession(ctx context.Context, cfg SessionConfig) (*Session, error)
+	// CreateSession creates a new conversation session
+	CreateSession(ctx context.Context, cfg SessionConfig) (*Session, error)
 
-    // GetSession retrieves an existing session by ID
-    GetSession(sessionID string) (*Session, error)
+	// GetSession retrieves an existing session by ID
+	GetSession(sessionID string) (*Session, error)
 
-    // ListSessions returns all active session IDs
-    ListSessions() []string
+	// ListSessions returns all active session IDs
+	ListSessions() []string
 
-    // CloseSession closes a session and removes it from the manager
-    CloseSession(sessionID string) error
+	// CloseSession closes a session and removes it from the manager
+	CloseSession(sessionID string) error
 
-    // SubmitOp submits an operation to a session for processing
-    SubmitOp(ctx context.Context, sessionID string, op protocol.Op) error
+	// SubmitOp submits an operation to a session for processing
+	SubmitOp(ctx context.Context, sessionID string, op protocol.Op) error
 
-    // ResumeSession resumes an existing session from history if available
-    ResumeSession(ctx context.Context, sessionID string) (*Session, error)
+	// ResumeSession resumes an existing session from history if available
+	ResumeSession(ctx context.Context, sessionID string) (*Session, error)
 
-    // Close closes all sessions and shuts down the manager
-    Close() error
+	// SwitchModel switches the model for an existing session
+	SwitchModel(ctx context.Context, sessionID string, modelID string) error
+
+	// Close closes all sessions and shuts down the manager
+	Close() error
 }
 
 // manager implements ConversationManager.
 type manager struct {
-    mu       sync.RWMutex
-    sessions map[string]*Session
-    client   client.Client
-    orch     *orchestrator.Orchestrator
+	mu       sync.RWMutex
+	sessions map[string]*Session
+	client   client.Client
+	orch     *orchestrator.Orchestrator
+	notifier *notify.Notifier
 
-    // History persistence settings
-    historyFs    afero.Fs
-    sessionsRoot string
-    enableHistory bool
+	// History persistence settings
+	historyFs     afero.Fs
+	sessionsRoot  string
+	enableHistory bool
 
 	// Optional history persistence interface (placeholder for future implementation)
 	// historyStore HistoryStore
@@ -58,28 +65,37 @@ type manager struct {
 
 // ManagerConfig contains configuration for the conversation manager.
 type ManagerConfig struct {
-    Client client.Client
-    Orchestrator *orchestrator.Orchestrator
-    // History settings
-    HistoryFs     afero.Fs
-    SessionsRoot  string
-    EnableHistory bool
+	Client       client.Client
+	Orchestrator *orchestrator.Orchestrator
+	// History settings
+	HistoryFs     afero.Fs
+	SessionsRoot  string
+	EnableHistory bool
+	// Notification settings
+	NotifyConfig *config.NotifyConfig
 }
 
 // NewManager creates a new conversation manager.
 func NewManager(cfg ManagerConfig) (ConversationManager, error) {
-    if cfg.Client == nil {
-        return nil, fmt.Errorf("client is required")
-    }
+	if cfg.Client == nil {
+		return nil, fmt.Errorf("client is required")
+	}
 
-    return &manager{
-        sessions:      make(map[string]*Session),
-        client:        cfg.Client,
-        orch:          cfg.Orchestrator,
-        historyFs:     cfg.HistoryFs,
-        sessionsRoot:  cfg.SessionsRoot,
-        enableHistory: cfg.EnableHistory,
-    }, nil
+	// Initialize notifier if configuration is provided
+	var notifier *notify.Notifier
+	if cfg.NotifyConfig != nil {
+		notifier = notify.NewNotifier(convertNotifyConfig(cfg.NotifyConfig))
+	}
+
+	return &manager{
+		sessions:      make(map[string]*Session),
+		client:        cfg.Client,
+		orch:          cfg.Orchestrator,
+		notifier:      notifier,
+		historyFs:     cfg.HistoryFs,
+		sessionsRoot:  cfg.SessionsRoot,
+		enableHistory: cfg.EnableHistory,
+	}, nil
 }
 
 // CreateSession creates a new conversation session.
@@ -92,25 +108,25 @@ func (m *manager) CreateSession(ctx context.Context, cfg SessionConfig) (*Sessio
 		return nil, fmt.Errorf("session %s already exists", cfg.ID)
 	}
 
-    // Use manager's client if not provided
-    if cfg.Client == nil {
-        cfg.Client = m.client
-    }
+	// Use manager's client if not provided
+	if cfg.Client == nil {
+		cfg.Client = m.client
+	}
 
-    // Use manager's orchestrator if not provided
-    if cfg.Orchestrator == nil {
-        cfg.Orchestrator = m.orch
-    }
+	// Use manager's orchestrator if not provided
+	if cfg.Orchestrator == nil {
+		cfg.Orchestrator = m.orch
+	}
 
-    // Set up history if enabled
-    if m.enableHistory && m.historyFs != nil && m.sessionsRoot != "" {
-        sessionDir := filepath.Join(m.sessionsRoot, cfg.ID)
-        hp, err := persistence.NewHistoryPersistence(m.historyFs, sessionDir)
-        if err != nil {
-            return nil, fmt.Errorf("failed to set up history persistence: %w", err)
-        }
-        cfg.History = hp
-    }
+	// Set up history if enabled
+	if m.enableHistory && m.historyFs != nil && m.sessionsRoot != "" {
+		sessionDir := filepath.Join(m.sessionsRoot, cfg.ID)
+		hp, err := persistence.NewHistoryPersistence(m.historyFs, sessionDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to set up history persistence: %w", err)
+		}
+		cfg.History = hp
+	}
 
 	// Create the session
 	session, err := NewSession(cfg)
@@ -118,10 +134,17 @@ func (m *manager) CreateSession(ctx context.Context, cfg SessionConfig) (*Sessio
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
-    // Store the session
-    m.sessions[cfg.ID] = session
+	// Store the session
+	m.sessions[cfg.ID] = session
 
-    return session, nil
+	// Emit session configured event
+	if err := session.EmitSessionConfigured(ctx); err != nil {
+		// Log error but don't fail session creation
+		// The session is still usable even if the event fails to emit
+		_ = err
+	}
+
+	return session, nil
 }
 
 // GetSession retrieves an existing session by ID.
@@ -180,8 +203,8 @@ func (m *manager) SubmitOp(ctx context.Context, sessionID string, op protocol.Op
 	}
 
 	// Route based on operation type
-    switch o := op.(type) {
-    case *protocol.OpUserInput:
+	switch o := op.(type) {
+	case *protocol.OpUserInput:
 		// Transform user input into a full user turn using the session's current turn context
 		turnCtx := session.GetTurnContext()
 		turn := &protocol.OpUserTurn{
@@ -193,9 +216,9 @@ func (m *manager) SubmitOp(ctx context.Context, sessionID string, op protocol.Op
 			Effort:         turnCtx.Effort,
 			Summary:        turnCtx.Summary,
 		}
-        return m.handleUserTurn(ctx, session, turn)
-    case *protocol.OpUserTurn:
-        return m.handleUserTurn(ctx, session, o)
+		return m.handleUserTurn(ctx, session, turn)
+	case *protocol.OpUserTurn:
+		return m.handleUserTurn(ctx, session, o)
 
 	case *protocol.OpInterrupt:
 		return m.handleInterrupt(ctx, session, o)
@@ -222,13 +245,13 @@ func (m *manager) handleUserTurn(ctx context.Context, session *Session, op *prot
 	}
 
 	// Submit the turn to the session
-    submissionID, err := session.SubmitTurn(ctx, op)
-    if err != nil {
-        return fmt.Errorf("failed to submit turn: %w", err)
-    }
+	submissionID, err := session.SubmitTurn(ctx, op)
+	if err != nil {
+		return fmt.Errorf("failed to submit turn: %w", err)
+	}
 
-    // Record submission to history if enabled
-    session.RecordSubmission(&protocol.Submission{ID: submissionID, Op: op})
+	// Record submission to history if enabled
+	session.RecordSubmission(&protocol.Submission{ID: submissionID, Op: op})
 
 	// Process the turn in a goroutine
 	go func() {
@@ -251,12 +274,27 @@ func (m *manager) handleUserTurn(ctx context.Context, session *Session, op *prot
 
 			// Emit error event
 			_ = processor.emitError(turnCtx, submissionID, err.Error()) // nolint:errcheck
+
+			// Send error notification
+			if m.notifier != nil {
+				_ = m.notifier.NotifyTurnError(turnCtx, session.ID(), submissionID, err.Error())
+			}
 			return
 		}
 
 		// Mark turn as completed
 		if err := session.CompleteTurn(); err != nil {
 			_ = session.FailTurn(err.Error()) // nolint:errcheck
+			// Send error notification
+			if m.notifier != nil {
+				_ = m.notifier.NotifyTurnError(turnCtx, session.ID(), submissionID, err.Error())
+			}
+		} else {
+			// Send completion notification
+			if m.notifier != nil {
+				lastMsg := session.GetLastAgentMessage()
+				_ = m.notifier.NotifyTurnComplete(turnCtx, session.ID(), submissionID, lastMsg)
+			}
 		}
 	}()
 
@@ -270,6 +308,11 @@ func (m *manager) handleInterrupt(ctx context.Context, session *Session, op *pro
 
 	// Record submission to history if enabled
 	session.RecordSubmission(&protocol.Submission{ID: submissionID, Op: op})
+
+	// Send abort notification
+	if m.notifier != nil {
+		_ = m.notifier.NotifyTurnAborted(ctx, session.ID(), submissionID, "User interrupted turn")
+	}
 
 	return session.SubmitInterrupt(ctx)
 }
@@ -347,6 +390,52 @@ func (m *manager) handleOverrideTurnContext(ctx context.Context, session *Sessio
 	return session.UpdateTurnContext(op)
 }
 
+// SwitchModel switches the model for an existing session.
+// This validates the model is available and updates the session configuration.
+// The new model takes effect on the next turn submission.
+func (m *manager) SwitchModel(ctx context.Context, sessionID string, modelID string) error {
+	// Get the session
+	session, err := m.GetSession(sessionID)
+	if err != nil {
+		return err
+	}
+
+	// Validate the new model exists
+	model, err := models.ResolveModel(modelID)
+	if err != nil {
+		return fmt.Errorf("invalid model: %w", err)
+	}
+
+	// Update the turn context with new model
+	override := &protocol.OpOverrideTurnContext{
+		Model: &model.ID,
+	}
+
+	if err := session.UpdateTurnContext(override); err != nil {
+		return fmt.Errorf("failed to update session model: %w", err)
+	}
+
+	// Emit session configured event with new model
+	submissionID := fmt.Sprintf("switch_model_%s_%d", sessionID, time.Now().UnixNano())
+	event := &protocol.Event{
+		ID: submissionID,
+		Msg: &protocol.EventSessionConfigured{
+			SessionID:         sessionID,
+			Model:             model.ID,
+			HistoryLogID:      0,
+			HistoryEntryCount: 0,
+			RolloutPath:       "",
+		},
+	}
+
+	if err := session.EmitEvent(ctx, event); err != nil {
+		// Log but don't fail - the model switch succeeded
+		_ = err
+	}
+
+	return nil
+}
+
 // Close closes all sessions and shuts down the manager.
 func (m *manager) Close() error {
 	m.mu.Lock()
@@ -378,94 +467,155 @@ func (m *manager) Close() error {
 // - Turn context (cwd, approval policy, sandbox policy, model)
 // - Session state validation
 func (m *manager) ResumeSession(ctx context.Context, sessionID string) (*Session, error) {
-    // Check in-memory first
-    if session, err := m.GetSession(sessionID); err == nil {
-        return session, nil
-    }
+	// Check in-memory first
+	if session, err := m.GetSession(sessionID); err == nil {
+		return session, nil
+	}
 
-    // Require history configuration
-    if !m.enableHistory || m.historyFs == nil || m.sessionsRoot == "" {
-        return nil, fmt.Errorf("history persistence not configured")
-    }
+	// Require history configuration
+	if !m.enableHistory || m.historyFs == nil || m.sessionsRoot == "" {
+		return nil, fmt.Errorf("history persistence not configured")
+	}
 
-    // Open history
-    sessionDir := filepath.Join(m.sessionsRoot, sessionID)
-    hp, err := persistence.NewHistoryPersistence(m.historyFs, sessionDir)
-    if err != nil {
-        return nil, fmt.Errorf("failed to open history: %w", err)
-    }
+	// Open history
+	sessionDir := filepath.Join(m.sessionsRoot, sessionID)
+	hp, err := persistence.NewHistoryPersistence(m.historyFs, sessionDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open history: %w", err)
+	}
 
-    // Load history entries (both submissions and events)
-    submissions, events, err := hp.LoadHistory()
-    if err != nil {
-        return nil, fmt.Errorf("failed to load history: %w", err)
-    }
+	// Load history entries (both submissions and events)
+	submissions, events, err := hp.LoadHistory()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load history: %w", err)
+	}
 
-    // Reconstruct complete session state from history
-    reconstructed, err := ReconstructStateFromHistory(submissions, events)
-    if err != nil {
-        return nil, fmt.Errorf("failed to reconstruct state: %w", err)
-    }
+	// Reconstruct complete session state from history
+	reconstructed, err := ReconstructStateFromHistory(submissions, events)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reconstruct state: %w", err)
+	}
 
-    // Validate reconstructed state
-    if err := ValidateResumedState(reconstructed); err != nil {
-        return nil, fmt.Errorf("invalid session state: %w", err)
-    }
+	// Validate reconstructed state
+	if err := ValidateResumedState(reconstructed); err != nil {
+		return nil, fmt.Errorf("invalid session state: %w", err)
+	}
 
-    // Ensure we have a valid turn context
-    turnCtx := reconstructed.TurnContext
-    if turnCtx == nil {
-        // Fallback to defaults if reconstruction failed
-        turnCtx = &TurnContext{
-            Cwd:            ".",
-            ApprovalPolicy: "auto",
-            SandboxPolicy:  protocol.SandboxPolicy{Mode: "native"},
-            Model:          "",
-        }
-    }
+	// Ensure we have a valid turn context
+	turnCtx := reconstructed.TurnContext
+	if turnCtx == nil {
+		// Fallback to defaults if reconstruction failed
+		turnCtx = &TurnContext{
+			Cwd:            ".",
+			ApprovalPolicy: "auto",
+			SandboxPolicy:  protocol.SandboxPolicy{Mode: "native"},
+			Model:          "",
+		}
+	}
 
-    // Create new session with reconstructed context
-    sess, err := NewSession(SessionConfig{
-        ID:           sessionID,
-        Client:       m.client,
-        TurnContext:  turnCtx,
-        Orchestrator: m.orch,
-        History:      hp,
-    })
-    if err != nil {
-        return nil, fmt.Errorf("failed to create session: %w", err)
-    }
+	// Create new session with reconstructed context
+	sess, err := NewSession(SessionConfig{
+		ID:           sessionID,
+		Client:       m.client,
+		TurnContext:  turnCtx,
+		Orchestrator: m.orch,
+		History:      hp,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
 
-    // Restore session state from reconstruction
-    if reconstructed.LastAgentMessage != "" {
-        sess.SetLastAgentMessage(reconstructed.LastAgentMessage)
-    }
+	// Restore session state from reconstruction
+	if reconstructed.LastAgentMessage != "" {
+		sess.SetLastAgentMessage(reconstructed.LastAgentMessage)
+	}
 
-    if reconstructed.TokenUsage != nil {
-        sess.UpdateTokenUsage(reconstructed.TokenUsage)
-    }
+	if reconstructed.TokenUsage != nil {
+		sess.UpdateTokenUsage(reconstructed.TokenUsage)
+	}
 
-    // Log reconstruction statistics for observability
-    // In production, you might want to emit metrics here
-    _ = reconstructed.TotalTurns
-    _ = reconstructed.CompletedTurns
-    _ = reconstructed.TotalToolExecutions
+	// Log reconstruction statistics for observability
+	// In production, you might want to emit metrics here
+	_ = reconstructed.TotalTurns
+	_ = reconstructed.CompletedTurns
+	_ = reconstructed.TotalToolExecutions
 
-    // Check for interrupted turns
-    if reconstructed.HasIncompleteTurn {
-        // Session starts in idle state by default, which is correct for incomplete turns
-        // The user can submit a new turn when ready
-    }
+	// Check for interrupted turns
+	if reconstructed.HasIncompleteTurn {
+		// Session starts in idle state by default, which is correct for incomplete turns
+		// The user can submit a new turn when ready
+	}
 
-    if reconstructed.InterruptedTurnID != "" {
-        // The last turn was interrupted - session should be in idle or interrupted state
-        // The state machine will handle this correctly
-    }
+	if reconstructed.InterruptedTurnID != "" {
+		// The last turn was interrupted - session should be in idle or interrupted state
+		// The state machine will handle this correctly
+	}
 
-    // Store in manager
-    m.mu.Lock()
-    m.sessions[sessionID] = sess
-    m.mu.Unlock()
+	// Store in manager
+	m.mu.Lock()
+	m.sessions[sessionID] = sess
+	m.mu.Unlock()
 
-    return sess, nil
+	// Set history metadata (using reconstructed turn count as entry count)
+	sess.SetHistoryMetadata(0, reconstructed.CompletedTurns)
+
+	// Emit session configured event for resumed session
+	if err := sess.EmitSessionConfigured(ctx); err != nil {
+		// Log error but don't fail session resume
+		_ = err
+	}
+
+	return sess, nil
+}
+
+// convertNotifyConfig converts config.NotifyConfig to notify.Config.
+func convertNotifyConfig(cfg *config.NotifyConfig) *notify.Config {
+	if cfg == nil {
+		return &notify.Config{}
+	}
+
+	notifyCfg := &notify.Config{}
+
+	// Convert OnTurnComplete
+	if cfg.OnTurnComplete != nil {
+		notifyCfg.OnTurnComplete = &notify.NotificationConfig{
+			Command: cfg.OnTurnComplete.Command,
+			Enabled: cfg.OnTurnComplete.Enabled,
+			Env:     cfg.OnTurnComplete.Env,
+		}
+	}
+
+	// Convert OnError
+	if cfg.OnError != nil {
+		notifyCfg.OnError = &notify.NotificationConfig{
+			Command: cfg.OnError.Command,
+			Enabled: cfg.OnError.Enabled,
+			Env:     cfg.OnError.Env,
+		}
+	}
+
+	// Convert OnApprovalNeeded
+	if cfg.OnApprovalNeeded != nil {
+		notifyCfg.OnApprovalNeeded = &notify.NotificationConfig{
+			Command: cfg.OnApprovalNeeded.Command,
+			Enabled: cfg.OnApprovalNeeded.Enabled,
+			Env:     cfg.OnApprovalNeeded.Env,
+		}
+	}
+
+	// Convert OnTurnAborted
+	if cfg.OnTurnAborted != nil {
+		notifyCfg.OnTurnAborted = &notify.NotificationConfig{
+			Command: cfg.OnTurnAborted.Command,
+			Enabled: cfg.OnTurnAborted.Enabled,
+			Env:     cfg.OnTurnAborted.Env,
+		}
+	}
+
+	// Convert timeout
+	if cfg.ScriptTimeoutSec != nil && *cfg.ScriptTimeoutSec > 0 {
+		notifyCfg.ScriptTimeout = time.Duration(*cfg.ScriptTimeoutSec * float64(time.Second))
+	}
+
+	return notifyCfg
 }

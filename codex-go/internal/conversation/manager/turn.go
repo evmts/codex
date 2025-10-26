@@ -251,6 +251,7 @@ func (tp *TurnProcessor) processStream(ctx context.Context, submissionID string,
 		assistantMsg := client.Message{
 			Role:      "assistant",
 			Content:   result.lastMessage,
+			Reasoning: result.reasoningContent,
 			ToolCalls: result.toolCalls,
 		}
 		conversationMessages = append(conversationMessages, assistantMsg)
@@ -296,8 +297,9 @@ func (tp *TurnProcessor) processStream(ctx context.Context, submissionID string,
 
 // streamResult holds the result of processing a single stream.
 type streamResult struct {
-	lastMessage string
-	toolCalls   []client.ToolCall
+	lastMessage     string
+	reasoningContent string
+	toolCalls       []client.ToolCall
 }
 
 // processSingleStream processes a single stream and returns the result.
@@ -352,6 +354,7 @@ func (tp *TurnProcessor) processSingleStream(ctx context.Context, submissionID s
 			case client.EventTypeReasoningContentDelta:
 				// Handle reasoning deltas
 				if delta, ok := evt.Data.(string); ok {
+					result.reasoningContent += delta
 					if err := tp.emitAgentReasoningDelta(ctx, submissionID, delta); err != nil {
 						return nil, err
 					}
@@ -432,6 +435,7 @@ func (tp *TurnProcessor) emitAgentMessageDelta(ctx context.Context, submissionID
 }
 
 func (tp *TurnProcessor) emitAgentReasoningDelta(ctx context.Context, submissionID string, delta string) error {
+	// Emit the reasoning delta event
 	event := &protocol.Event{
 		ID: submissionID,
 		Msg: &protocol.EventAgentReasoningDelta{
@@ -439,7 +443,19 @@ func (tp *TurnProcessor) emitAgentReasoningDelta(ctx context.Context, submission
 		},
 	}
 
-	return tp.session.EmitEvent(ctx, event)
+	if err := tp.session.EmitEvent(ctx, event); err != nil {
+		return err
+	}
+
+	// Also emit raw content delta for clients that want raw reasoning
+	rawEvent := &protocol.Event{
+		ID: submissionID,
+		Msg: &protocol.EventAgentReasoningRawContentDelta{
+			Delta: delta,
+		},
+	}
+
+	return tp.session.EmitEvent(ctx, rawEvent)
 }
 
 func (tp *TurnProcessor) emitError(ctx context.Context, submissionID string, errMsg string) error {

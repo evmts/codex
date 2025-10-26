@@ -25,6 +25,7 @@ type Session struct {
     client    client.Client
     createdAt time.Time
     orch      *orchestrator.Orchestrator
+    provider  string // API provider name
 
     // Mutable fields (protected by mutex)
     mu                   sync.RWMutex
@@ -37,6 +38,8 @@ type Session struct {
     tokenUsage           *protocol.TokenUsage
     lastAgentMessage     string
     reconstructedHistory []client.Message // Messages from history reconstruction for resume
+    historyLogID         uint64           // ID for history log
+    historyEntryCount    int              // Number of entries in history
 
     // History persistence
     history          *persistence.HistoryPersistence
@@ -85,6 +88,7 @@ type SessionConfig struct {
     EventHandlers []EventHandler
     Orchestrator  *orchestrator.Orchestrator
     History       *persistence.HistoryPersistence
+    Provider      string // API provider name (e.g., "anthropic", "openai")
 }
 
 // NewSession creates a new conversation session.
@@ -104,6 +108,7 @@ func NewSession(cfg SessionConfig) (*Session, error) {
     s := &Session{
         id:            cfg.ID,
         client:        cfg.Client,
+        provider:      cfg.Provider,
         createdAt:     time.Now(),
         stateMachine:  NewStateMachine(),
         eventHandlers: cfg.EventHandlers,
@@ -496,4 +501,45 @@ func (s *Session) GetReconstructedHistory() []client.Message {
     result := make([]client.Message, len(s.reconstructedHistory))
     copy(result, s.reconstructedHistory)
     return result
+}
+
+// SetHistoryMetadata sets the history log ID and entry count.
+func (s *Session) SetHistoryMetadata(logID uint64, entryCount int) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.historyLogID = logID
+    s.historyEntryCount = entryCount
+}
+
+// GetHistoryMetadata returns the history log ID and entry count.
+func (s *Session) GetHistoryMetadata() (uint64, int) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    return s.historyLogID, s.historyEntryCount
+}
+
+// EmitSessionConfigured emits the EventSessionConfigured event.
+// This should be called after session initialization or resume.
+func (s *Session) EmitSessionConfigured(ctx context.Context) error {
+    s.mu.RLock()
+    turnCtx := *s.turnContext
+    historyLogID := s.historyLogID
+    historyEntryCount := s.historyEntryCount
+    s.mu.RUnlock()
+
+    // Build the event
+    event := &protocol.Event{
+        ID: fmt.Sprintf("session_config_%s", s.id),
+        Msg: &protocol.EventSessionConfigured{
+            SessionID:         s.id,
+            Model:             turnCtx.Model,
+            ReasoningEffort:   turnCtx.Effort,
+            HistoryLogID:      historyLogID,
+            HistoryEntryCount: historyEntryCount,
+            InitialMessages:   nil, // TODO: populate if needed for resume
+            RolloutPath:       "",  // Not implemented yet
+        },
+    }
+
+    return s.EmitEvent(ctx, event)
 }
