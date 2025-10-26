@@ -170,6 +170,27 @@ func (e *UnsupportedOperationError) Error() string {
 	return msg
 }
 
+// UnauthorizedError represents a 401 Unauthorized response.
+// This typically indicates an expired or invalid API key/token.
+type UnauthorizedError struct {
+	// Message describes the authorization failure
+	Message string
+
+	// RequestID helps correlate with server logs
+	RequestID string
+
+	// CanRefresh indicates if token refresh should be attempted
+	CanRefresh bool
+}
+
+func (e *UnauthorizedError) Error() string {
+	msg := "unauthorized: " + e.Message
+	if e.RequestID != "" {
+		msg += fmt.Sprintf(" (request_id: %s)", e.RequestID)
+	}
+	return msg
+}
+
 // Helper functions for creating common errors
 
 // NewStreamError creates a stream error.
@@ -235,5 +256,13 @@ func NewUnsupportedOperationError(operation, provider string) *UnsupportedOperat
 	return &UnsupportedOperationError{
 		Operation: operation,
 		Provider:  provider,
+	}
+}
+
+// NewUnauthorizedError creates an unauthorized error.
+func NewUnauthorizedError(message string, canRefresh bool) *UnauthorizedError {
+	return &UnauthorizedError{
+		Message:    message,
+		CanRefresh: canRefresh,
 	}
 }

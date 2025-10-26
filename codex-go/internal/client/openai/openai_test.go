@@ -2,10 +2,13 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -747,4 +750,404 @@ func TestRequestTimeout(t *testing.T) {
 	_, err = c.Complete(ctx, req)
 	assert.Error(t, err)
 	// Should be a timeout or context error
+}
+
+// Test401WithoutRefreshFunc tests handling 401 without token refresh configured
+func Test401WithoutRefreshFunc(t *testing.T) {
+	mockServer := test.NewHTTPMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "Invalid API key",
+				"type":    "invalid_request_error",
+			},
+		})
+	})
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "invalid-key",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	ctx := test.ContextWithTimeout(t, 5*time.Second)
+	req := &client.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []client.Message{
+			client.NewUserMessage("Test"),
+		},
+	}
+
+	resp, err := c.Complete(ctx, req)
+	assert.Error(t, err)
+	assert.Nil(t, resp)
+	assert.IsType(t, &client.UnauthorizedError{}, err)
+
+	unauthorizedErr := err.(*client.UnauthorizedError)
+	assert.False(t, unauthorizedErr.CanRefresh, "should indicate refresh is not available")
+}
+
+// Test401WithSuccessfulRefresh tests successful token refresh on 401
+func Test401WithSuccessfulRefresh(t *testing.T) {
+	requestCount := 0
+	mockServer := test.NewHTTPMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		authHeader := r.Header.Get("Authorization")
+
+		if authHeader == "Bearer old-token" {
+			// First request with old token - return 401
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": "Invalid or expired token",
+					"type":    "invalid_request_error",
+				},
+			})
+		} else if authHeader == "Bearer new-token" {
+			// Second request with new token - return success
+			resp := &client.ChatCompletionResponse{
+				ID:      "chatcmpl-123",
+				Object:  "chat.completion",
+				Created: time.Now().Unix(),
+				Model:   "gpt-4",
+				Choices: []client.Choice{
+					{
+						Index: 0,
+						Message: client.Message{
+							Role:    "assistant",
+							Content: "Success with refreshed token!",
+						},
+						FinishReason: "stop",
+					},
+				},
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(resp)
+		} else {
+			// Unexpected token
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": "Unexpected token",
+					"type":    "invalid_request_error",
+				},
+			})
+		}
+	})
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "old-token",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+		TokenRefreshFunc: func(ctx context.Context, oldToken string) (string, error) {
+			assert.Equal(t, "old-token", oldToken)
+			return "new-token", nil
+		},
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	ctx := test.ContextWithTimeout(t, 5*time.Second)
+	req := &client.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []client.Message{
+			client.NewUserMessage("Test"),
+		},
+	}
+
+	resp, err := c.Complete(ctx, req)
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.Equal(t, "Success with refreshed token!", resp.Choices[0].Message.Content)
+	assert.Equal(t, 2, requestCount, "should have made exactly 2 requests (initial + retry)")
+}
+
+// Test401WithFailedRefresh tests failed token refresh on 401
+func Test401WithFailedRefresh(t *testing.T) {
+	mockServer := test.NewHTTPMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "Invalid token",
+				"type":    "invalid_request_error",
+			},
+		})
+	})
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "old-token",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+		TokenRefreshFunc: func(ctx context.Context, oldToken string) (string, error) {
+			return "", fmt.Errorf("refresh service unavailable")
+		},
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	ctx := test.ContextWithTimeout(t, 5*time.Second)
+	req := &client.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []client.Message{
+			client.NewUserMessage("Test"),
+		},
+	}
+
+	resp, err := c.Complete(ctx, req)
+	assert.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "token refresh failed")
+	assert.Contains(t, err.Error(), "refresh service unavailable")
+}
+
+// Test401RefreshStillUnauthorized tests when refresh succeeds but new token is also invalid
+func Test401RefreshStillUnauthorized(t *testing.T) {
+	requestCount := 0
+	mockServer := test.NewHTTPMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		// Always return 401, even for refreshed token
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "Invalid token",
+				"type":    "invalid_request_error",
+			},
+		})
+	})
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "old-token",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+		TokenRefreshFunc: func(ctx context.Context, oldToken string) (string, error) {
+			return "new-token", nil
+		},
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	ctx := test.ContextWithTimeout(t, 5*time.Second)
+	req := &client.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []client.Message{
+			client.NewUserMessage("Test"),
+		},
+	}
+
+	resp, err := c.Complete(ctx, req)
+	assert.Error(t, err)
+	assert.Nil(t, resp)
+	assert.IsType(t, &client.UnauthorizedError{}, err)
+	assert.Equal(t, 2, requestCount, "should have made exactly 2 requests (initial + retry)")
+}
+
+// TestStreamWith401AndSuccessfulRefresh tests streaming with token refresh
+func TestStreamWith401AndSuccessfulRefresh(t *testing.T) {
+	requestCount := 0
+	mockServer := test.NewHTTPMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		authHeader := r.Header.Get("Authorization")
+
+		if authHeader == "Bearer old-token" {
+			// First request with old token - return 401
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": "Invalid or expired token",
+					"type":    "invalid_request_error",
+				},
+			})
+		} else if authHeader == "Bearer new-token" {
+			// Second request with new token - return success stream
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+
+			flusher := w.(http.Flusher)
+
+			// Send initial chunk
+			w.Write([]byte("data: " + mustMarshal(t, client.ChatCompletionChunk{
+				ID:      "chatcmpl-123",
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   "gpt-4",
+				Choices: []client.ChunkChoice{
+					{
+						Index: 0,
+						Delta: client.MessageDelta{
+							Role:    "assistant",
+							Content: "Refreshed!",
+						},
+					},
+				},
+			}) + "\n\n"))
+			flusher.Flush()
+
+			// Send done signal
+			w.Write([]byte("data: [DONE]\n\n"))
+			flusher.Flush()
+		}
+	})
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "old-token",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+		TokenRefreshFunc: func(ctx context.Context, oldToken string) (string, error) {
+			return "new-token", nil
+		},
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	ctx := test.ContextWithTimeout(t, 5*time.Second)
+	req := &client.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []client.Message{
+			client.NewUserMessage("Test"),
+		},
+	}
+
+	eventCh, err := c.Stream(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, eventCh)
+
+	var events []client.StreamEvent
+	for event := range eventCh {
+		events = append(events, event)
+		if event.Error != nil {
+			t.Fatalf("unexpected error in stream: %v", event.Error)
+		}
+	}
+
+	assert.NotEmpty(t, events)
+	assert.Equal(t, 2, requestCount, "should have made exactly 2 requests (initial + retry)")
+
+	// Verify we got the content from the refreshed token
+	hasExpectedContent := false
+	for _, e := range events {
+		if e.Type == client.EventTypeOutputTextDelta {
+			delta, ok := e.Data.(string)
+			if ok && strings.Contains(delta, "Refreshed") {
+				hasExpectedContent = true
+			}
+		}
+	}
+	assert.True(t, hasExpectedContent, "should have received content from refreshed token")
+}
+
+// TestConcurrentRequestsWithTokenRefresh tests thread-safety of token refresh
+func TestConcurrentRequestsWithTokenRefresh(t *testing.T) {
+	requestCount := 0
+	var requestMutex sync.Mutex
+
+	mockServer := test.NewHTTPMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requestMutex.Lock()
+		requestCount++
+		localCount := requestCount
+		requestMutex.Unlock()
+
+		authHeader := r.Header.Get("Authorization")
+
+		// First 3 requests get 401, rest get success
+		if localCount <= 3 && authHeader == "Bearer old-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": "Invalid token",
+					"type":    "invalid_request_error",
+				},
+			})
+		} else if authHeader == "Bearer new-token" {
+			resp := &client.ChatCompletionResponse{
+				ID:      "chatcmpl-123",
+				Object:  "chat.completion",
+				Created: time.Now().Unix(),
+				Model:   "gpt-4",
+				Choices: []client.Choice{
+					{
+						Index: 0,
+						Message: client.Message{
+							Role:    "assistant",
+							Content: "Success",
+						},
+						FinishReason: "stop",
+					},
+				},
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(resp)
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": "Unexpected state",
+					"type":    "invalid_request_error",
+				},
+			})
+		}
+	})
+
+	refreshCount := 0
+	var refreshMutex sync.Mutex
+
+	cfg := client.ClientConfig{
+		BaseURL:        mockServer.URL,
+		APIKey:         "old-token",
+		Model:          "gpt-4",
+		RequestTimeout: 5 * time.Second,
+		TokenRefreshFunc: func(ctx context.Context, oldToken string) (string, error) {
+			refreshMutex.Lock()
+			refreshCount++
+			refreshMutex.Unlock()
+			// Simulate refresh delay
+			time.Sleep(100 * time.Millisecond)
+			return "new-token", nil
+		},
+	}
+
+	c, err := NewClient(cfg)
+	require.NoError(t, err)
+
+	// Make 3 concurrent requests
+	var wg sync.WaitGroup
+	errors := make([]error, 3)
+	responses := make([]*client.ChatCompletionResponse, 3)
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx := test.ContextWithTimeout(t, 10*time.Second)
+			req := &client.ChatCompletionRequest{
+				Model: "gpt-4",
+				Messages: []client.Message{
+					client.NewUserMessage("Test"),
+				},
+			}
+			responses[idx], errors[idx] = c.Complete(ctx, req)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All requests should succeed
+	for i := 0; i < 3; i++ {
+		assert.NoError(t, errors[i], "request %d should succeed", i)
+		assert.NotNil(t, responses[i], "request %d should have response", i)
+	}
+
+	// Token refresh should have happened at least once
+	assert.Greater(t, refreshCount, 0, "token refresh should have been called")
 }

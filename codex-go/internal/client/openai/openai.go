@@ -28,6 +28,10 @@ type Client struct {
 	autoCompactTokenLimit int64
 	modelInfoInitialized  bool
 	modelInfoOnce         sync.Once
+
+	// Token refresh management
+	tokenMutex sync.RWMutex // Protects currentToken
+	currentToken string      // Current API token (synchronized for concurrent access)
 }
 
 // NewClient creates a new OpenAI client with the given configuration.
@@ -60,9 +64,10 @@ func NewClient(cfg client.ClientConfig) (*Client, error) {
 	}
 
 	c := &Client{
-		config:     cfg,
-		httpClient: cfg.HTTPClient,
-		rateLimits: newRateLimitTracker(),
+		config:       cfg,
+		httpClient:   cfg.HTTPClient,
+		rateLimits:   newRateLimitTracker(),
+		currentToken: cfg.APIKey, // Initialize with the provided API key
 	}
 
 	// Initialize model info
@@ -121,6 +126,20 @@ func (c *Client) initModelInfo() {
 	}
 
 	c.modelInfoInitialized = true
+}
+
+// getToken returns the current API token (thread-safe).
+func (c *Client) getToken() string {
+	c.tokenMutex.RLock()
+	defer c.tokenMutex.RUnlock()
+	return c.currentToken
+}
+
+// updateToken updates the current API token (thread-safe).
+func (c *Client) updateToken(newToken string) {
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+	c.currentToken = newToken
 }
 
 // completeWithRetry performs a non-streaming request with retry logic.
@@ -200,6 +219,40 @@ func (c *Client) doComplete(ctx context.Context, req *client.ChatCompletionReque
 
 	// Update rate limits
 	c.updateRateLimits(httpResp.Headers)
+
+	// Check for 401 Unauthorized and attempt token refresh if available
+	if httpResp.StatusCode == http.StatusUnauthorized && c.config.TokenRefreshFunc != nil {
+		_, readErr := io.ReadAll(httpResp.Body)
+		if readErr != nil {
+			return nil, httpResp.StatusCode, fmt.Errorf("failed to read error response body: %w", readErr)
+		}
+
+		// Attempt token refresh
+		oldToken := c.getToken()
+		newToken, refreshErr := c.config.TokenRefreshFunc(ctx, oldToken)
+		if refreshErr != nil {
+			// Refresh failed, return authorization error with refresh failure
+			return nil, httpResp.StatusCode, fmt.Errorf("token refresh failed: %w", refreshErr)
+		}
+
+		// Update token
+		c.updateToken(newToken)
+
+		// Retry the request with new token
+		httpReq, err = c.buildRequest(ctx, req)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		httpResp, err = c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, 0, client.NewConnectionError(c.config.BaseURL, err)
+		}
+		defer httpResp.Body.Close()
+
+		// Update rate limits from retry
+		c.updateRateLimits(httpResp.Headers)
+	}
 
 	// Check status code
 	if httpResp.StatusCode != http.StatusOK {
@@ -309,6 +362,35 @@ func (c *Client) doStream(ctx context.Context, req *client.ChatCompletionRequest
 	// Update rate limits
 	c.updateRateLimits(httpResp.Headers)
 
+	// Check for 401 Unauthorized and attempt token refresh if available
+	if httpResp.StatusCode == http.StatusUnauthorized && c.config.TokenRefreshFunc != nil {
+		// Attempt token refresh
+		oldToken := c.getToken()
+		newToken, refreshErr := c.config.TokenRefreshFunc(ctx, oldToken)
+		if refreshErr != nil {
+			// Refresh failed, return authorization error with refresh failure
+			return fmt.Errorf("token refresh failed: %w", refreshErr), httpResp.StatusCode
+		}
+
+		// Update token
+		c.updateToken(newToken)
+
+		// Retry the request with new token
+		httpReq, err = c.buildRequest(ctx, req)
+		if err != nil {
+			return err, 0
+		}
+
+		httpResp, err = c.httpClient.Do(httpReq)
+		if err != nil {
+			return client.NewConnectionError(c.config.BaseURL, err), 0
+		}
+		defer httpResp.Body.Close()
+
+		// Update rate limits from retry
+		c.updateRateLimits(httpResp.Headers)
+	}
+
 	// Check status code
 	if httpResp.StatusCode != http.StatusOK {
 		body, readErr := io.ReadAll(httpResp.Body)
@@ -344,7 +426,7 @@ func (c *Client) buildRequest(ctx context.Context, req *client.ChatCompletionReq
 	// Build headers
 	headers := make(map[string]string)
 	headers["Content-Type"] = "application/json"
-	headers["Authorization"] = "Bearer " + c.config.APIKey
+	headers["Authorization"] = "Bearer " + c.getToken() // Use current token (thread-safe)
 
 	// Add conversation ID if present
 	if c.config.ConversationID != "" {
@@ -380,6 +462,12 @@ func (c *Client) handleErrorResponse(statusCode int, body []byte) error {
 		bodyStr = errorResp.Error.Message
 
 		// Check for specific error types
+		if statusCode == http.StatusUnauthorized {
+			// 401 Unauthorized
+			canRefresh := c.config.TokenRefreshFunc != nil
+			return client.NewUnauthorizedError(bodyStr, canRefresh)
+		}
+
 		if errorResp.Error.Code == "context_length_exceeded" ||
 			strings.Contains(errorResp.Error.Message, "context") {
 			return client.NewContextWindowExceededError()
@@ -388,6 +476,10 @@ func (c *Client) handleErrorResponse(statusCode int, body []byte) error {
 		if errorResp.Error.Type == "rate_limit_error" || statusCode == http.StatusTooManyRequests {
 			return client.NewUsageLimitError("", nil)
 		}
+	} else if statusCode == http.StatusUnauthorized {
+		// Failed to parse error, but still 401
+		canRefresh := c.config.TokenRefreshFunc != nil
+		return client.NewUnauthorizedError(bodyStr, canRefresh)
 	}
 
 	return client.NewUnexpectedStatusError(statusCode, bodyStr)

@@ -497,10 +497,10 @@ func TestIntegrationErrorHandling(t *testing.T) {
 
 		_, err = c.Complete(ctx, req)
 		require.Error(t, err)
-		assert.IsType(t, &client.UnexpectedStatusError{}, err)
+		assert.IsType(t, &client.UnauthorizedError{}, err)
 
-		statusErr := err.(*client.UnexpectedStatusError)
-		assert.Equal(t, http.StatusUnauthorized, statusErr.StatusCode)
+		authErr := err.(*client.UnauthorizedError)
+		assert.Contains(t, authErr.Message, "Invalid API key")
 	})
 
 	t.Run("context window exceeded", func(t *testing.T) {

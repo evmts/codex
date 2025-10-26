@@ -178,6 +178,11 @@ func DefaultRetryConfig() RetryConfig {
 	}
 }
 
+// TokenRefreshFunc is called when a 401 Unauthorized is received.
+// It should return a new API key/token or an error if refresh fails.
+// The context can be used to implement timeouts for the refresh operation.
+type TokenRefreshFunc func(ctx context.Context, oldToken string) (newToken string, err error)
+
 // ClientConfig holds configuration for creating a client.
 type ClientConfig struct {
 	// BaseURL is the API endpoint (e.g., "https://api.openai.com/v1")
@@ -206,6 +211,11 @@ type ClientConfig struct {
 
 	// ConversationID is used for prompt caching and session tracking
 	ConversationID string
+
+	// TokenRefreshFunc is called when a 401 Unauthorized response is received.
+	// If set, the client will attempt to refresh the token and retry the request.
+	// Only one retry attempt will be made per request.
+	TokenRefreshFunc TokenRefreshFunc
 }
 
 // RateLimitSnapshot captures rate limit information from API responses.

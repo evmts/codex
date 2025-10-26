@@ -24,6 +24,13 @@ func newStreamParser(config client.StreamConfig) *streamParser {
 	}
 }
 
+// scanResult represents the result of a scanner.Scan() operation.
+type scanResult struct {
+	ok   bool
+	line string
+	err  error
+}
+
 // parse reads and parses an SSE stream, emitting events to the channel.
 func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- client.StreamEvent) error {
 	scanner := bufio.NewScanner(r)
@@ -40,6 +47,41 @@ func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- cl
 	// Track accumulated tool calls for streaming
 	toolCallAccumulator := newToolCallAccumulator()
 
+	// Create a single goroutine for scanning that runs for the lifetime of this function.
+	// This prevents goroutine leaks that would occur if we created a new goroutine on each iteration.
+	scanCh := make(chan scanResult)
+	scanDone := make(chan struct{})
+	defer close(scanDone)
+
+	go func() {
+		defer close(scanCh) // Close channel when goroutine exits
+		for {
+			// Perform the blocking scan operation
+			ok := scanner.Scan()
+			var line string
+			var err error
+			if ok {
+				// Capture the line text immediately while it's still valid
+				line = scanner.Text()
+			} else {
+				err = scanner.Err()
+			}
+
+			// Try to send result, but respect cancellation
+			select {
+			case scanCh <- scanResult{ok: ok, line: line, err: err}:
+				if !ok {
+					// Scanner is done, exit goroutine
+					return
+				}
+				// Successfully sent, continue to next iteration
+			case <-scanDone:
+				// Parse function returned, exit goroutine
+				return
+			}
+		}
+	}()
+
 	for {
 		// Reset idle timer
 		if idleTimer != nil {
@@ -53,11 +95,6 @@ func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- cl
 		}
 
 		// Wait for next line or timeout
-		lineCh := make(chan bool, 1)
-		go func() {
-			lineCh <- scanner.Scan()
-		}()
-
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -69,50 +106,51 @@ func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- cl
 			}
 			return client.NewIdleTimeoutError(p.config.IdleTimeout)
 
-		case ok := <-lineCh:
-			if !ok {
+		case result := <-scanCh:
+			if !result.ok {
 				// End of stream
-				if err := scanner.Err(); err != nil {
-					return fmt.Errorf("stream scan error: %w", err)
+				if result.err != nil {
+					return fmt.Errorf("stream scan error: %w", result.err)
 				}
 				return nil
 			}
-		}
 
-		line := scanner.Text()
+			// Use the line from the scan result (captured in the goroutine)
+			line := result.line
 
-		// Skip empty lines
-		if line == "" {
-			continue
-		}
+			// Skip empty lines
+			if line == "" {
+				continue
+			}
 
-		// Parse SSE line
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
+			// Parse SSE line
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
 
-		data := strings.TrimPrefix(line, "data: ")
+			data := strings.TrimPrefix(line, "data: ")
 
-		// Check for [DONE] marker
-		if data == "[DONE]" {
-			// Stream completed successfully
-			return nil
-		}
+			// Check for [DONE] marker
+			if data == "[DONE]" {
+				// Stream completed successfully
+				return nil
+			}
 
-		// Parse JSON chunk
-		var chunk client.ChatCompletionChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// Log but continue - some providers send non-JSON comments
-			continue
-		}
+			// Parse JSON chunk
+			var chunk client.ChatCompletionChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				// Log but continue - some providers send non-JSON comments
+				continue
+			}
 
-		// Process chunk and emit events
-		events := p.processChunk(&chunk, toolCallAccumulator)
-		for _, event := range events {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case eventCh <- event:
+			// Process chunk and emit events
+			events := p.processChunk(&chunk, toolCallAccumulator)
+			for _, event := range events {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case eventCh <- event:
+				}
 			}
 		}
 	}
