@@ -1,21 +1,80 @@
-# Codex Go TUI
+# Codex CLI
 
-The Codex Go terminal user interface (TUI) provides an interactive chat experience for AI-assisted coding sessions.
+A command-line interface for interacting with AI assistants with real-time streaming responses.
 
 ## Features
 
+- **Interactive TUI Mode**: Full-featured terminal interface with session management
+- **Non-Interactive CLI Mode**: Single message mode for scripting and automation
+- **Real-time Streaming**: See AI responses as they're generated
 - **Session Management**: Create and switch between multiple conversation sessions
-- **Interactive Conversations**: Type messages and receive streaming responses  
-- **Tool Approval**: Review and approve tool executions with detailed parameter inspection
-- **Status Bar**: Real-time display of model, token usage, and current mode
-- **Keyboard Shortcuts**: Efficient navigation without a mouse
+- **Tool Execution**: Watch tool calls and command outputs in real-time
+- **Token Tracking**: Monitor token usage throughout conversations
 
 ## Installation
 
 ```bash
+# Build from cmd/codex directory
+go build -o codex
+
+# Or from project root
 go build -o codex ./cmd/codex
+```
+
+## Configuration
+
+### Environment Variables
+
+- `ANTHROPIC_API_KEY` - API key for Anthropic Claude models (required if using Claude)
+- `OPENAI_API_KEY` - API key for OpenAI models (required if using OpenAI)
+- `API_BASE_URL` - Base URL for the API (default: `https://api.anthropic.com/v1`)
+- `MODEL` - Model to use (default: `claude-3-5-sonnet-20241022`)
+
+### Example Setup
+
+```bash
+# For Anthropic Claude
+export ANTHROPIC_API_KEY="your-api-key-here"
+
+# For OpenAI
+export OPENAI_API_KEY="your-api-key-here"
+export API_BASE_URL="https://api.openai.com/v1"
+export MODEL="gpt-4"
+```
+
+## Usage
+
+### Interactive Mode (TUI)
+
+Start the TUI by running without arguments:
+
+```bash
 ./codex
 ```
+
+### Non-Interactive Mode (CLI)
+
+Send a single message and get a streaming response:
+
+```bash
+# Basic usage
+./codex -m "What is 2+2?"
+
+# With specific session
+./codex -s "my-session" -m "Remember this conversation"
+
+# Continue in same session
+./codex -s "my-session" -m "What did we talk about?"
+
+# With specific model
+./codex --model "gpt-4" -m "Explain quantum computing"
+```
+
+#### Flags
+
+- `-m, --message` - Message to send (required for non-interactive mode)
+- `-s, --session` - Session ID to use (optional, auto-generated if not provided)
+- `--model` - Model to use (overrides MODEL env var)
 
 ## Keyboard Shortcuts
 
@@ -66,16 +125,78 @@ The TUI integrates with internal packages:
 - `internal/protocol`: Protocol types for operations and events
 - `internal/client`: AI model client interface
 
+## Testing
+
+Run the automated streaming test:
+
+```bash
+./scripts/test_streaming.sh
+```
+
+This validates:
+1. Basic message sending and streaming
+2. Real-time response streaming
+3. Session persistence across multiple messages
+
+## Architecture
+
+### Event-Driven Streaming
+
+The CLI uses an event-driven architecture for real-time streaming:
+
+1. **User Input** → Submitted to conversation manager
+2. **Turn Processing** → Manager processes turn in background
+3. **Events Emitted** → Protocol events sent to registered handlers
+4. **Event Types**:
+   - `EventTaskStarted` - Turn begins
+   - `EventAgentMessageDelta` - Streaming text chunks
+   - `EventTokenCount` - Token usage updates
+   - `EventExecCommandBegin/End` - Tool execution
+   - `EventToolCallApprovalNeeded` - Approval required
+   - `EventTaskComplete` - Turn complete
+
 ## Development
 
-### Testing
+### Building
 
-The TUI is designed with testable components. Core logic is separated from UI rendering to enable unit testing.
+```bash
+go build -o codex ./cmd/codex
+```
 
-### Future Enhancements
+### Running Tests
 
-- History persistence and session restoration
-- Syntax highlighting for code blocks
-- File tree viewer for workspace navigation
-- Search and filter capabilities
-- Configuration customization (themes, keybindings)
+```bash
+# Unit tests
+go test ./cmd/codex/...
+
+# Integration tests (requires API key)
+cd test/integration
+go test -v
+
+# Streaming validation
+./scripts/test_streaming.sh
+```
+
+## Troubleshooting
+
+### No API Key Error
+
+```
+Error: API key required: set OPENAI_API_KEY or ANTHROPIC_API_KEY environment variable
+```
+
+**Solution**: Set the appropriate environment variable.
+
+### No Response / Hanging
+
+- Check if the model name is valid for your provider
+- Verify the API key has permissions for the specified model
+- Look for error messages in stderr
+
+### Session Already Exists
+
+This can happen if a previous instance didn't clean up properly. Check for running processes:
+
+```bash
+ps aux | grep codex
+```
