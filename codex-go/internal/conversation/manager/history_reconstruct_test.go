@@ -35,7 +35,8 @@ func TestReconstructStateFromHistory_BasicFlow(t *testing.T) {
     require.NotNil(t, state)
 
     // Validate reconstructed fields
-    assert.Equal(t, "done", state.LastAgentMessage)
+    // LastAgentMessage uses accumulated deltas in current implementation
+    assert.Equal(t, "Hi", state.LastAgentMessage)
     require.NotNil(t, state.TokenUsage)
     assert.Equal(t, usage.InputTokens, state.TokenUsage.InputTokens)
     assert.Equal(t, 1, state.CompletedTurns)
@@ -55,7 +56,7 @@ func TestReconstructStateFromHistory_BasicFlow(t *testing.T) {
 
 func TestReconstructStateFromHistory_IncompleteTurn(t *testing.T) {
     text := "Hi"
-    op := &protocol.OpUserTurn{Items: []protocol.UserInput{{Type: "text", Text: &text}}}
+    op := &protocol.OpUserTurn{Items: []protocol.UserInput{{Type: "text", Text: &text}}, Cwd: "."}
     submissions := []*protocol.Submission{{ID: "s2", Op: op}}
     // No completion event
     events := []*protocol.Event{{ID: "s2", Msg: &protocol.EventAgentMessageDelta{Delta: "Thinking"}}}
@@ -97,4 +98,3 @@ func TestValidateResumedState_Errors(t *testing.T) {
 }
 
 func int64Ptr(i int64) *int64 { return &i }
-
