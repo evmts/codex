@@ -10,6 +10,7 @@ import (
     "github.com/evmts/codex/codex-go/internal/protocol"
     "github.com/evmts/codex/codex-go/internal/tools/orchestrator"
     "github.com/evmts/codex/codex-go/internal/tools/runtime"
+    "github.com/evmts/codex/codex-go/internal/tools/schema"
 )
 
 // TurnProcessor handles the execution of a turn including:
@@ -102,6 +103,20 @@ func (tp *TurnProcessor) buildRequest(op *protocol.OpUserTurn) (*client.ChatComp
 		Stream:   true,
 	}
 
+	// Add tools if orchestrator is available
+	if tp.session.Orchestrator() != nil {
+		orch := tp.session.Orchestrator()
+		registry := orch.GetRegistry()
+		if registry != nil {
+			// Generate tool schemas from registry
+			toolSchemas := schema.GenerateToolSchemas(registry)
+			if len(toolSchemas) > 0 {
+				req.Tools = toolSchemas
+				req.ParallelToolCalls = true
+			}
+		}
+	}
+
 	// Add reasoning configuration if specified
 	if op.Effort != nil || op.Summary != "" {
 		req.Reasoning = &client.Reasoning{}
@@ -126,6 +141,20 @@ func (tp *TurnProcessor) buildRequestWithMessages(messages []client.Message) (*c
 		Model:    turnCtx.Model,
 		Messages: messages,
 		Stream:   true,
+	}
+
+	// Add tools if orchestrator is available (needed for multi-turn tool use)
+	if tp.session.Orchestrator() != nil {
+		orch := tp.session.Orchestrator()
+		registry := orch.GetRegistry()
+		if registry != nil {
+			// Generate tool schemas from registry
+			toolSchemas := schema.GenerateToolSchemas(registry)
+			if len(toolSchemas) > 0 {
+				req.Tools = toolSchemas
+				req.ParallelToolCalls = true
+			}
+		}
 	}
 
 	// Add reasoning configuration if specified in turn context
