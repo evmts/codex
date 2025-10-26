@@ -198,9 +198,10 @@ func ReconstructStateFromHistory(submissions []*protocol.Submission, events []*p
 			})
 
 		case *protocol.EventTokenCount:
-			// Update token usage
+			// Update token usage (use TotalTokenUsage for session cumulative, copy to avoid pointer aliasing)
 			if msg.Info != nil {
-				state.TokenUsage = &msg.Info.LastTokenUsage
+				usage := msg.Info.TotalTokenUsage // Copy the value
+				state.TokenUsage = &usage
 			}
 
 		case *protocol.EventTaskComplete:
