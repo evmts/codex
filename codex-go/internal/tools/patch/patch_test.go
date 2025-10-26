@@ -1221,3 +1221,369 @@ func TestPatchTool_ComplexMultiFileScenario(t *testing.T) {
 	moveContent := test.ReadFileFS(t, fs, "/workspace/move_to.txt")
 	assert.Equal(t, "moving file\n", string(moveContent))
 }
+
+// ============================================================================
+// CRLF Line Ending Tests
+// ============================================================================
+
+func TestApplyPatch_CRLFFileWithLFPatch(t *testing.T) {
+	// Test that a file with CRLF endings can be patched with LF-style patch
+	fs := test.NewMemFS(t)
+	tool := NewPatchTool(fs)
+
+	// Create a file with CRLF line endings
+	originalContent := "line1\r\nline2\r\nline3\r\n"
+	test.WriteFileFS(t, fs, "/workspace/test.txt", []byte(originalContent))
+
+	// Create a unified diff with LF endings (as Git would generate)
+	diff := `--- a/test.txt
++++ b/test.txt
+@@ -1,3 +1,3 @@
+ line1
+-line2
++line2 modified
+ line3
+`
+
+	args := PatchArgs{
+		Patch: diff,
+		Root:  "/workspace",
+	}
+	argsJSON, _ := json.Marshal(args)
+
+	req := &runtime.ToolRequest{
+		CallID:           "call_123",
+		ToolName:             "apply_patch",
+		Arguments:        string(argsJSON),
+		WorkingDirectory: "/workspace",
+	}
+
+	ctx := test.LongContext(t)
+	resp, err := tool.Execute(ctx, req, &runtime.ExecutionContext{
+		SessionID: "session_123",
+		TurnID:    "turn_123",
+	})
+	require.NoError(t, err)
+	assert.True(t, *resp.Success)
+
+	// Read the result and verify CRLF is preserved
+	result := test.ReadFileFS(t, fs, "/workspace/test.txt")
+	expected := "line1\r\nline2 modified\r\nline3\r\n"
+	assert.Equal(t, expected, string(result), "CRLF line endings should be preserved")
+}
+
+func TestApplyPatch_LFFileWithCRLFPatch(t *testing.T) {
+	// Test that a file with LF endings can be patched with CRLF-style patch
+	fs := test.NewMemFS(t)
+	tool := NewPatchTool(fs)
+
+	// Create a file with LF line endings
+	originalContent := "line1\nline2\nline3\n"
+	test.WriteFileFS(t, fs, "/workspace/test.txt", []byte(originalContent))
+
+	// Create a unified diff with CRLF endings
+	diff := "--- a/test.txt\r\n+++ b/test.txt\r\n@@ -1,3 +1,3 @@\r\n line1\r\n-line2\r\n+line2 modified\r\n line3\r\n"
+
+	args := PatchArgs{
+		Patch: diff,
+		Root:  "/workspace",
+	}
+	argsJSON, _ := json.Marshal(args)
+
+	req := &runtime.ToolRequest{
+		CallID:           "call_123",
+		ToolName:             "apply_patch",
+		Arguments:        string(argsJSON),
+		WorkingDirectory: "/workspace",
+	}
+
+	ctx := test.LongContext(t)
+	resp, err := tool.Execute(ctx, req, &runtime.ExecutionContext{
+		SessionID: "session_123",
+		TurnID:    "turn_123",
+	})
+	require.NoError(t, err)
+	assert.True(t, *resp.Success)
+
+	// Read the result and verify LF is preserved
+	result := test.ReadFileFS(t, fs, "/workspace/test.txt")
+	expected := "line1\nline2 modified\nline3\n"
+	assert.Equal(t, expected, string(result), "LF line endings should be preserved")
+}
+
+func TestApplyPatch_MixedLineEndings(t *testing.T) {
+	// Test that a file with mixed line endings gets normalized to LF
+	fs := test.NewMemFS(t)
+	tool := NewPatchTool(fs)
+
+	// Create a file with mixed line endings
+	originalContent := "line1\r\nline2\nline3\r\n"
+	test.WriteFileFS(t, fs, "/workspace/test.txt", []byte(originalContent))
+
+	// Create a unified diff
+	diff := `--- a/test.txt
++++ b/test.txt
+@@ -1,3 +1,3 @@
+ line1
+-line2
++line2 modified
+ line3
+`
+
+	args := PatchArgs{
+		Patch: diff,
+		Root:  "/workspace",
+	}
+	argsJSON, _ := json.Marshal(args)
+
+	req := &runtime.ToolRequest{
+		CallID:           "call_123",
+		ToolName:             "apply_patch",
+		Arguments:        string(argsJSON),
+		WorkingDirectory: "/workspace",
+	}
+
+	ctx := test.LongContext(t)
+	resp, err := tool.Execute(ctx, req, &runtime.ExecutionContext{
+		SessionID: "session_123",
+		TurnID:    "turn_123",
+	})
+	require.NoError(t, err)
+	assert.True(t, *resp.Success)
+
+	// Read the result - mixed files are normalized to LF
+	result := test.ReadFileFS(t, fs, "/workspace/test.txt")
+	expected := "line1\nline2 modified\nline3\n"
+	assert.Equal(t, expected, string(result), "Mixed line endings should be normalized to LF")
+}
+
+func TestApplyPatch_CRLFAddFile(t *testing.T) {
+	// Test adding a new file preserves default LF endings
+	fs := test.NewMemFS(t)
+	tool := NewPatchTool(fs)
+
+	// Create a unified diff to add a new file
+	diff := `--- /dev/null
++++ b/newfile.txt
+@@ -0,0 +1,3 @@
++line1
++line2
++line3
+`
+
+	args := PatchArgs{
+		Patch: diff,
+		Root:  "/workspace",
+	}
+	argsJSON, _ := json.Marshal(args)
+
+	req := &runtime.ToolRequest{
+		CallID:           "call_123",
+		ToolName:             "apply_patch",
+		Arguments:        string(argsJSON),
+		WorkingDirectory: "/workspace",
+	}
+
+	ctx := test.LongContext(t)
+	resp, err := tool.Execute(ctx, req, &runtime.ExecutionContext{
+		SessionID: "session_123",
+		TurnID:    "turn_123",
+	})
+	require.NoError(t, err)
+	assert.True(t, *resp.Success)
+
+	// Read the result - new files should default to LF
+	result := test.ReadFileFS(t, fs, "/workspace/newfile.txt")
+	expected := "line1\nline2\nline3\n"
+	assert.Equal(t, expected, string(result), "New files should use LF line endings by default")
+}
+
+func TestApplyPatch_CRLFDeleteFile(t *testing.T) {
+	// Test deleting a file with CRLF endings
+	fs := test.NewMemFS(t)
+	tool := NewPatchTool(fs)
+
+	// Create a file with CRLF line endings
+	originalContent := "line1\r\nline2\r\nline3\r\n"
+	test.WriteFileFS(t, fs, "/workspace/delete.txt", []byte(originalContent))
+
+	// Create a unified diff to delete the file
+	diff := `--- a/delete.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-line1
+-line2
+-line3
+`
+
+	args := PatchArgs{
+		Patch: diff,
+		Root:  "/workspace",
+	}
+	argsJSON, _ := json.Marshal(args)
+
+	req := &runtime.ToolRequest{
+		CallID:           "call_123",
+		ToolName:             "apply_patch",
+		Arguments:        string(argsJSON),
+		WorkingDirectory: "/workspace",
+	}
+
+	ctx := test.LongContext(t)
+	resp, err := tool.Execute(ctx, req, &runtime.ExecutionContext{
+		SessionID: "session_123",
+		TurnID:    "turn_123",
+	})
+	require.NoError(t, err)
+	assert.True(t, *resp.Success)
+
+	// Verify file was deleted
+	test.AssertFileNotExistsFS(t, fs, "/workspace/delete.txt")
+}
+
+func TestApplyPatch_CRLFMoveFile(t *testing.T) {
+	// Test moving a file with CRLF endings preserves the line endings
+	fs := test.NewMemFS(t)
+	tool := NewPatchTool(fs)
+
+	// Create a file with CRLF line endings
+	originalContent := "line1\r\nline2\r\nline3\r\n"
+	test.WriteFileFS(t, fs, "/workspace/source.txt", []byte(originalContent))
+
+	// Create a unified diff to move/rename the file
+	diff := `--- a/source.txt
++++ b/dest.txt
+@@ -1,3 +1,3 @@
+ line1
+-line2
++line2 modified
+ line3
+`
+
+	args := PatchArgs{
+		Patch: diff,
+		Root:  "/workspace",
+	}
+	argsJSON, _ := json.Marshal(args)
+
+	req := &runtime.ToolRequest{
+		CallID:           "call_123",
+		ToolName:             "apply_patch",
+		Arguments:        string(argsJSON),
+		WorkingDirectory: "/workspace",
+	}
+
+	ctx := test.LongContext(t)
+	resp, err := tool.Execute(ctx, req, &runtime.ExecutionContext{
+		SessionID: "session_123",
+		TurnID:    "turn_123",
+	})
+	require.NoError(t, err)
+	assert.True(t, *resp.Success)
+
+	// Verify source file was removed
+	test.AssertFileNotExistsFS(t, fs, "/workspace/source.txt")
+
+	// Verify destination file has correct content with CRLF preserved
+	result := test.ReadFileFS(t, fs, "/workspace/dest.txt")
+	expected := "line1\r\nline2 modified\r\nline3\r\n"
+	assert.Equal(t, expected, string(result), "CRLF line endings should be preserved during move")
+}
+
+func TestApplyPatch_CRLFRollback(t *testing.T) {
+	// Test that rollback preserves original CRLF line endings
+	fs := test.NewMemFS(t)
+
+	// Create two files with CRLF line endings
+	file1Content := "line1\r\nline2\r\nline3\r\n"
+	file2Content := "foo\r\nbar\r\n"
+	test.WriteFileFS(t, fs, "/workspace/file1.txt", []byte(file1Content))
+	test.WriteFileFS(t, fs, "/workspace/file2.txt", []byte(file2Content))
+
+	// Create a patch that will succeed for file1 but fail for file2
+	diff := `--- a/file1.txt
++++ b/file1.txt
+@@ -1,3 +1,3 @@
+ line1
+-line2
++line2 modified
+ line3
+--- a/file2.txt
++++ b/file2.txt
+@@ -1,2 +1,2 @@
+ foo
+-nonexistent line
++this will fail
+`
+
+	patches, err := parseUnifiedDiff(diff)
+	require.NoError(t, err)
+
+	// Apply patches - should fail and rollback
+	_, err = applyPatches(fs, patches, "/workspace", false)
+	assert.Error(t, err, "Should fail because file2 patch doesn't match")
+
+	// Verify file1 was rolled back with original CRLF
+	result1 := test.ReadFileFS(t, fs, "/workspace/file1.txt")
+	assert.Equal(t, file1Content, string(result1), "Rollback should preserve original CRLF in file1")
+
+	// Verify file2 was unchanged with original CRLF
+	result2 := test.ReadFileFS(t, fs, "/workspace/file2.txt")
+	assert.Equal(t, file2Content, string(result2), "file2 should be unchanged with original CRLF")
+}
+
+func TestApplyPatch_ComplexCRLFScenario(t *testing.T) {
+	// Test a complex scenario with multiple files having different line endings
+	fs := test.NewMemFS(t)
+	tool := NewPatchTool(fs)
+
+	// Create files with different line endings
+	test.WriteFileFS(t, fs, "/workspace/crlf.txt", []byte("a\r\nb\r\nc\r\n"))
+	test.WriteFileFS(t, fs, "/workspace/lf.txt", []byte("x\ny\nz\n"))
+
+	// Create a patch that modifies both files
+	diff := `--- a/crlf.txt
++++ b/crlf.txt
+@@ -1,3 +1,3 @@
+ a
+-b
++B
+ c
+--- a/lf.txt
++++ b/lf.txt
+@@ -1,3 +1,3 @@
+ x
+-y
++Y
+ z
+`
+
+	args := PatchArgs{
+		Patch: diff,
+		Root:  "/workspace",
+	}
+	argsJSON, _ := json.Marshal(args)
+
+	req := &runtime.ToolRequest{
+		CallID:           "call_123",
+		ToolName:             "apply_patch",
+		Arguments:        string(argsJSON),
+		WorkingDirectory: "/workspace",
+	}
+
+	ctx := test.LongContext(t)
+	resp, err := tool.Execute(ctx, req, &runtime.ExecutionContext{
+		SessionID: "session_123",
+		TurnID:    "turn_123",
+	})
+	require.NoError(t, err)
+	assert.True(t, *resp.Success)
+
+	// Verify CRLF file kept CRLF
+	crlfResult := test.ReadFileFS(t, fs, "/workspace/crlf.txt")
+	assert.Equal(t, "a\r\nB\r\nc\r\n", string(crlfResult), "CRLF file should maintain CRLF")
+
+	// Verify LF file kept LF
+	lfResult := test.ReadFileFS(t, fs, "/workspace/lf.txt")
+	assert.Equal(t, "x\nY\nz\n", string(lfResult), "LF file should maintain LF")
+}

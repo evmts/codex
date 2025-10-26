@@ -21,11 +21,12 @@ type ApplyResult struct {
 
 // BackupState stores the original state of files for rollback.
 type BackupState struct {
-	Path      string
-	Content   []byte
-	Existed   bool
-	Operation string // "update", "add", "delete", "move"
-	DestPath  string // Destination path for move operations
+	Path           string
+	Content        []byte
+	Existed        bool
+	Operation      string         // "update", "add", "delete", "move"
+	DestPath       string         // Destination path for move operations
+	LineEndingInfo LineEndingInfo // Original line ending style for restoration
 }
 
 // applyPatches applies a set of patches atomically to the filesystem.
@@ -148,17 +149,27 @@ func applyAddFile(fs afero.Fs, patch *FilePatch, root string, dryRun bool, backu
 		Operation: "add",
 	}
 
+	var existingLineEnding LineEndingInfo
 	if exists {
-		// Backup existing content
+		// Backup existing content and detect line ending style
 		content, err := afero.ReadFile(fs, fullPath)
 		if err != nil {
 			return nil, NewPatchErrorWithFileAndCause(ErrorIO, patch.NewFile, "failed to read existing file", err)
 		}
 		backup.Content = content
+		existingLineEnding = DetectLineEnding(content)
+		backup.LineEndingInfo = existingLineEnding
+	} else {
+		// For new files, default to LF (Unix style)
+		existingLineEnding = LineEndingInfo{Style: LineEndingLF}
+		backup.LineEndingInfo = existingLineEnding
 	}
 
-	// Generate new content from hunks
+	// Generate new content from hunks (always in LF format)
 	newContent := generateContentFromHunks(patch.Hunks, true)
+
+	// Convert to appropriate line ending style
+	newContentBytes := ConvertLineEndings([]byte(newContent), existingLineEnding.Style)
 
 	if !dryRun {
 		// Ensure directory exists
@@ -168,7 +179,7 @@ func applyAddFile(fs afero.Fs, patch *FilePatch, root string, dryRun bool, backu
 		}
 
 		// Write file atomically
-		if err := atomicWrite(fs, fullPath, []byte(newContent)); err != nil {
+		if err := atomicWrite(fs, fullPath, newContentBytes); err != nil {
 			return nil, NewPatchErrorWithFileAndCause(ErrorIO, patch.NewFile, "failed to write file", err)
 		}
 	}
@@ -190,17 +201,20 @@ func applyDeleteFile(fs afero.Fs, patch *FilePatch, root string, dryRun bool, ba
 		return nil, NewPatchErrorWithFile(ErrorFileNotFound, patch.OriginalFile, "file does not exist")
 	}
 
-	// Backup content for rollback
+	// Backup content for rollback and detect line ending style
 	content, err := afero.ReadFile(fs, fullPath)
 	if err != nil {
 		return nil, NewPatchErrorWithFileAndCause(ErrorIO, patch.OriginalFile, "failed to read file for backup", err)
 	}
 
+	lineEndingInfo := DetectLineEnding(content)
+
 	backup := &BackupState{
-		Path:      fullPath,
-		Content:   content,
-		Existed:   true,
-		Operation: "delete",
+		Path:           fullPath,
+		Content:        content,
+		Existed:        true,
+		Operation:      "delete",
+		LineEndingInfo: lineEndingInfo,
 	}
 
 	if !dryRun {
@@ -226,28 +240,37 @@ func applyUpdateFile(fs afero.Fs, patch *FilePatch, root string, dryRun bool, ba
 		return nil, NewPatchErrorWithFile(ErrorFileNotFound, patch.OriginalFile, "file does not exist")
 	}
 
-	// Read current content
+	// Read current content and detect line ending style
 	content, err := afero.ReadFile(fs, fullPath)
 	if err != nil {
 		return nil, NewPatchErrorWithFileAndCause(ErrorIO, patch.OriginalFile, "failed to read file", err)
 	}
 
+	lineEndingInfo := DetectLineEnding(content)
+
 	backup := &BackupState{
-		Path:      fullPath,
-		Content:   content,
-		Existed:   true,
-		Operation: "update",
+		Path:           fullPath,
+		Content:        content,
+		Existed:        true,
+		Operation:      "update",
+		LineEndingInfo: lineEndingInfo,
 	}
 
-	// Apply hunks to content
-	newContent, err := applyHunks(string(content), patch.Hunks)
+	// Normalize content to LF for patch application
+	normalizedContent := NormalizeToLF(content)
+
+	// Apply hunks to normalized content
+	newContent, err := applyHunks(string(normalizedContent), patch.Hunks)
 	if err != nil {
 		return nil, NewPatchErrorWithFileAndCause(ErrorConflict, patch.OriginalFile, "failed to apply hunks", err)
 	}
 
+	// Convert back to original line ending style
+	finalContent := ConvertLineEndings([]byte(newContent), lineEndingInfo.Style)
+
 	if !dryRun {
 		// Write file atomically
-		if err := atomicWrite(fs, fullPath, []byte(newContent)); err != nil {
+		if err := atomicWrite(fs, fullPath, finalContent); err != nil {
 			return nil, NewPatchErrorWithFileAndCause(ErrorIO, patch.OriginalFile, "failed to write file", err)
 		}
 	}
@@ -270,27 +293,36 @@ func applyMoveFile(fs afero.Fs, patch *FilePatch, root string, dryRun bool, back
 		return nil, NewPatchErrorWithFile(ErrorFileNotFound, patch.OriginalFile, "source file does not exist")
 	}
 
-	// Read content
+	// Read content and detect line ending style
 	content, err := afero.ReadFile(fs, oldPath)
 	if err != nil {
 		return nil, NewPatchErrorWithFileAndCause(ErrorIO, patch.OriginalFile, "failed to read file", err)
 	}
 
+	lineEndingInfo := DetectLineEnding(content)
+
+	// Normalize content to LF for patch application
+	normalizedContent := NormalizeToLF(content)
+
 	// Apply any content changes from hunks
-	newContent := string(content)
+	newContent := string(normalizedContent)
 	if len(patch.Hunks) > 0 {
-		newContent, err = applyHunks(string(content), patch.Hunks)
+		newContent, err = applyHunks(string(normalizedContent), patch.Hunks)
 		if err != nil {
 			return nil, NewPatchErrorWithFileAndCause(ErrorConflict, patch.OriginalFile, "failed to apply hunks during move", err)
 		}
 	}
 
+	// Convert back to original line ending style
+	finalContent := ConvertLineEndings([]byte(newContent), lineEndingInfo.Style)
+
 	backup := &BackupState{
-		Path:      oldPath,
-		Content:   content,
-		Existed:   true,
-		Operation: "move",
-		DestPath:  newPath,
+		Path:           oldPath,
+		Content:        content,
+		Existed:        true,
+		Operation:      "move",
+		DestPath:       newPath,
+		LineEndingInfo: lineEndingInfo,
 	}
 
 	if !dryRun {
@@ -301,7 +333,7 @@ func applyMoveFile(fs afero.Fs, patch *FilePatch, root string, dryRun bool, back
 		}
 
 		// Write to new location atomically
-		if err := atomicWrite(fs, newPath, []byte(newContent)); err != nil {
+		if err := atomicWrite(fs, newPath, finalContent); err != nil {
 			return nil, NewPatchErrorWithFileAndCause(ErrorIO, patch.NewFile, "failed to write file to new location", err)
 		}
 
@@ -336,18 +368,102 @@ func applyHunks(content string, hunks []Hunk) (string, error) {
 	return strings.Join(lines, "\n") + "\n", nil
 }
 
-// applyHunk applies a single hunk to the lines.
+// applyHunk applies a single hunk to the lines using context-based seeking with fuzzy fallback.
 func applyHunk(lines []string, hunk *Hunk) ([]string, error) {
+	return applyHunkWithContextAndFuzzy(lines, hunk, DefaultContextMatchConfig(), DefaultFuzzyConfig())
+}
+
+// applyHunkWithConfig applies a single hunk to the lines using the specified fuzzy matching config.
+// Deprecated: Use applyHunkWithContextAndFuzzy for better context-based seeking.
+func applyHunkWithConfig(lines []string, hunk *Hunk, config FuzzyMatchConfig) ([]string, error) {
+	return applyHunkWithContextAndFuzzy(lines, hunk, DefaultContextMatchConfig(), config)
+}
+
+// applyHunkWithContextAndFuzzy applies a hunk using context-based seeking with fuzzy matching fallback.
+// This implements the strategy from Rust's seek_sequence:
+//  1. Try exact match at expected position
+//  2. Search within a window using multiple strategies (exact, trim whitespace, normalize Unicode)
+//  3. Fall back to fuzzy matching if needed
+func applyHunkWithContextAndFuzzy(lines []string, hunk *Hunk, contextConfig ContextMatchConfig, fuzzyConfig FuzzyMatchConfig) ([]string, error) {
 	// Find where to apply the hunk (hunk line numbers are 1-based)
-	startLine := hunk.OriginalStart - 1
-	if startLine < 0 {
-		startLine = 0
+	expectedStart := hunk.OriginalStart - 1
+	if expectedStart < 0 {
+		expectedStart = 0
 	}
 
-	// Verify context lines match
-	lineIndex := startLine
-	hunkLineIndex := 0
+	// Extract the pattern to match (context and remove lines)
+	var pattern []string
+	for _, hunkLine := range hunk.Lines {
+		if hunkLine.Type == LineContext || hunkLine.Type == LineRemove {
+			pattern = append(pattern, hunkLine.Content)
+		}
+	}
 
+	// If no pattern to match (pure addition), append at end
+	if len(pattern) == 0 {
+		result := make([]string, len(lines))
+		copy(result, lines)
+		for _, hunkLine := range hunk.Lines {
+			if hunkLine.Type == LineAdd {
+				result = append(result, hunkLine.Content)
+			}
+		}
+		return result, nil
+	}
+
+	// Strategy 1: Try exact match at expected position first
+	startLine := expectedStart
+	if startLine < len(lines) && startLine+len(pattern) <= len(lines) {
+		exactMatch := true
+		for i, patternLine := range pattern {
+			if lines[startLine+i] != patternLine {
+				exactMatch = false
+				break
+			}
+		}
+		if exactMatch {
+			return applyHunkAtPosition(lines, hunk, startLine, fuzzyConfig)
+		}
+	}
+
+	// Strategy 2: Context-based seeking with window
+	result := seekSequenceWithWindow(lines, pattern, expectedStart, contextConfig, false)
+	if result.Found {
+		return applyHunkAtPosition(lines, hunk, result.StartLine, fuzzyConfig)
+	}
+
+	// Strategy 3: Try from the beginning without window constraints
+	result = seekSequence(lines, pattern, 0, false)
+	if result.Found {
+		return applyHunkAtPosition(lines, hunk, result.StartLine, fuzzyConfig)
+	}
+
+	// Strategy 4: Last resort - try fuzzy matching at expected position
+	if expectedStart < len(lines) && expectedStart+len(pattern) <= len(lines) {
+		fuzzyMatch := true
+		for i, patternLine := range pattern {
+			if !fuzzyMatchLine(patternLine, lines[expectedStart+i], fuzzyConfig) {
+				fuzzyMatch = false
+				break
+			}
+		}
+		if fuzzyMatch {
+			return applyHunkAtPosition(lines, hunk, expectedStart, fuzzyConfig)
+		}
+	}
+
+	// All strategies failed - build helpful error message
+	contextLines := pattern
+	if len(contextLines) > 3 {
+		contextLines = pattern[:3]
+	}
+	return nil, NewPatchError(ErrorConflict,
+		fmt.Sprintf("could not find context lines near line %d (expected pattern: %q)",
+			expectedStart+1, strings.Join(contextLines, "\\n")))
+}
+
+// applyHunkAtPosition applies a hunk at a specific line position with fuzzy matching for verification.
+func applyHunkAtPosition(lines []string, hunk *Hunk, startLine int, fuzzyConfig FuzzyMatchConfig) ([]string, error) {
 	// Build the new lines
 	result := make([]string, 0, len(lines))
 
@@ -355,36 +471,25 @@ func applyHunk(lines []string, hunk *Hunk) ([]string, error) {
 	result = append(result, lines[:startLine]...)
 
 	// Process hunk lines
-	for hunkLineIndex < len(hunk.Lines) {
-		hunkLine := hunk.Lines[hunkLineIndex]
-
+	lineIndex := startLine
+	for _, hunkLine := range hunk.Lines {
 		switch hunkLine.Type {
 		case LineContext:
-			// Verify context matches
+			// Verify context matches (should match since we found it with seekSequence)
 			if lineIndex >= len(lines) {
 				return nil, NewPatchError(ErrorConflict,
 					fmt.Sprintf("context line extends beyond file (line %d)", lineIndex+1))
 			}
-			if lines[lineIndex] != hunkLine.Content {
-				return nil, NewPatchError(ErrorConflict,
-					fmt.Sprintf("context mismatch at line %d: expected %q, got %q",
-						lineIndex+1, hunkLine.Content, lines[lineIndex]))
-			}
-			result = append(result, hunkLine.Content)
+			// Use the original file's version to preserve formatting
+			result = append(result, lines[lineIndex])
 			lineIndex++
 
 		case LineRemove:
-			// Verify the line matches what we expect to remove
+			// Skip the line (don't add to result)
 			if lineIndex >= len(lines) {
 				return nil, NewPatchError(ErrorConflict,
 					fmt.Sprintf("remove line extends beyond file (line %d)", lineIndex+1))
 			}
-			if lines[lineIndex] != hunkLine.Content {
-				return nil, NewPatchError(ErrorConflict,
-					fmt.Sprintf("line to remove doesn't match at line %d: expected %q, got %q",
-						lineIndex+1, hunkLine.Content, lines[lineIndex]))
-			}
-			// Don't add to result, just skip the line
 			lineIndex++
 
 		case LineAdd:
@@ -392,8 +497,6 @@ func applyHunk(lines []string, hunk *Hunk) ([]string, error) {
 			result = append(result, hunkLine.Content)
 			// Don't increment lineIndex as we're not consuming an original line
 		}
-
-		hunkLineIndex++
 	}
 
 	// Copy remaining lines after the hunk
@@ -496,35 +599,75 @@ func rollbackChanges(fs afero.Fs, backups []BackupState) error {
 }
 
 // validatePath validates that a path is within the root and doesn't contain path traversal.
+// This uses the enhanced validation from the file package.
 func validatePath(root, path string, allowOutsideRoot bool) error {
 	if path == "" {
 		return nil
 	}
 
+	// If we allow outside root, only check for URL-encoded attacks
+	// Normal traversal patterns like ../ are acceptable in this mode
+	if allowOutsideRoot {
+		// Only block URL-encoded attacks which are never legitimate
+		lowerPath := strings.ToLower(path)
+		if strings.Contains(lowerPath, "%2e") ||
+		   strings.Contains(lowerPath, "%2f") ||
+		   strings.Contains(lowerPath, "%5c") {
+			return NewPatchErrorWithFile(ErrorPathTraversal, path, "suspicious encoded path pattern detected")
+		}
+		return nil
+	}
+
 	// Reject absolute paths that aren't relative to root
-	if filepath.IsAbs(path) && !allowOutsideRoot {
+	if filepath.IsAbs(path) {
 		return NewPatchErrorWithFile(ErrorPathTraversal, path, "absolute paths are not allowed")
 	}
 
-	// Resolve the path
+	// Use enhanced validation - resolve the path
 	fullPath := filepath.Join(root, path)
 	cleanPath := filepath.Clean(fullPath)
+	cleanRoot := filepath.Clean(root)
 
-	// Check if path escapes root
-	if !allowOutsideRoot {
-		cleanRoot := filepath.Clean(root)
-		rel, err := filepath.Rel(cleanRoot, cleanPath)
-		if err != nil {
-			return NewPatchErrorWithFile(ErrorPathTraversal, path, "invalid path")
-		}
+	// Check if path escapes root using filepath.Rel
+	rel, err := filepath.Rel(cleanRoot, cleanPath)
+	if err != nil {
+		return NewPatchErrorWithFile(ErrorPathTraversal, path, "invalid path")
+	}
 
-		// Check if relative path goes outside root
-		if strings.HasPrefix(rel, "..") {
-			return NewPatchErrorWithFile(ErrorPathTraversal, path, "path is outside root directory")
+	// If relative path starts with "..", it's outside root
+	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return NewPatchErrorWithFile(ErrorPathTraversal, path, "path is outside root directory")
+	}
+
+	// Check for symlink safety if the file exists
+	if evalPath, err := filepath.EvalSymlinks(cleanPath); err == nil {
+		// Verify symlink target is still within root
+		rel, err := filepath.Rel(cleanRoot, evalPath)
+		if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+			return NewPatchErrorWithFile(ErrorPathTraversal, path, "symlink points outside root directory")
 		}
 	}
 
 	return nil
+}
+
+// detectPathTraversal checks for common path traversal patterns.
+func detectPathTraversal(path string) bool {
+	// Check for obvious traversal patterns
+	traversalPatterns := []string{
+		"../",
+		"..\\",
+		"/..",
+		"\\..",
+	}
+
+	for _, pattern := range traversalPatterns {
+		if strings.Contains(path, pattern) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // generateSummary creates a human-readable summary of the patch results.

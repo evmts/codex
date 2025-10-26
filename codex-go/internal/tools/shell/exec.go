@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/evmts/codex/codex-go/internal/sandbox"
 	"github.com/evmts/codex/codex-go/internal/tools/runtime"
 )
 
@@ -24,14 +25,21 @@ type CommandSpec struct {
 
 	// CallID identifies this command execution
 	CallID string
+
+	// SandboxPolicy specifies the sandbox policy to apply (optional)
+	SandboxPolicy *sandbox.PolicyConfig
 }
 
 // CommandExecutor handles the execution of shell commands.
-type CommandExecutor struct{}
+type CommandExecutor struct {
+	sandboxManager *sandbox.SandboxManager
+}
 
 // NewCommandExecutor creates a new command executor.
 func NewCommandExecutor() *CommandExecutor {
-	return &CommandExecutor{}
+	return &CommandExecutor{
+		sandboxManager: sandbox.NewSandboxManager(),
+	}
 }
 
 // Execute runs a command and returns the result.
@@ -81,6 +89,25 @@ func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCt
 		// Just capture output
 		cmd.Stdout = capturer.stdout
 		cmd.Stderr = capturer.stderr
+	}
+
+	// Apply sandbox policy if specified
+	var sandboxInfo *sandbox.SandboxInfo
+	if spec.SandboxPolicy != nil {
+		workspace := spec.WorkingDirectory
+		if workspace == "" {
+			workspace = "."
+		}
+
+		info, err := e.sandboxManager.ApplyToCommand(cmd, spec.SandboxPolicy, workspace)
+		if err != nil {
+			return nil, runtime.NewToolErrorWithCause(
+				runtime.ErrorExecution,
+				fmt.Sprintf("failed to apply sandbox: %v", err),
+				err,
+			)
+		}
+		sandboxInfo = info
 	}
 
 	// Execute the command
@@ -135,6 +162,16 @@ func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCt
 		ExitCode:       &exitCode,
 		ExecutionTime:  executionTime,
 		StreamedOutput: execCtx.OutputWriter != nil,
+	}
+
+	// Add sandbox metadata if sandboxing was applied
+	if sandboxInfo != nil && sandboxInfo.Applied {
+		if resp.Metadata == nil {
+			resp.Metadata = make(map[string]interface{})
+		}
+		resp.Metadata["sandbox_type"] = sandboxInfo.Type.String()
+		resp.Metadata["sandbox_applied"] = sandboxInfo.Applied
+		resp.Metadata["sandbox_reason"] = sandboxInfo.Reason
 	}
 
 	return resp, nil

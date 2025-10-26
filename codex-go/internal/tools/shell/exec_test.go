@@ -232,6 +232,116 @@ func TestCommandExecutorExecuteEmptyCommand(t *testing.T) {
 	assert.Equal(t, runtime.ErrorInvalidArguments, toolErr.Kind)
 }
 
+// TestCommandExecutorExecuteBinaryOutput tests execution of commands producing binary output
+func TestCommandExecutorExecuteBinaryOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	executor := NewCommandExecutor()
+	ctx := context.Background()
+
+	tests := []struct {
+		name        string
+		command     []string
+		expectBinary bool
+	}{
+		{
+			name:        "gzip output",
+			command:     []string{"sh", "-c", "echo 'test data' | gzip"},
+			expectBinary: true,
+		},
+		{
+			name:        "tar output",
+			command:     []string{"sh", "-c", "echo 'test' > /tmp/test.txt && tar -cf - /tmp/test.txt 2>/dev/null"},
+			expectBinary: true,
+		},
+		{
+			name:        "printf binary",
+			command:     []string{"sh", "-c", "printf '\\x00\\x01\\x02\\x03\\x04'"},
+			expectBinary: true,
+		},
+		{
+			name:        "text output",
+			command:     []string{"echo", "hello world"},
+			expectBinary: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &CommandSpec{
+				Command:          tt.command,
+				WorkingDirectory: "/tmp",
+				CallID:           "test-binary",
+			}
+
+			execCtx := &runtime.ExecutionContext{
+				SessionID: "test-session",
+				TurnID:    "test-turn",
+				SandboxAttempt: &runtime.SandboxAttempt{
+					Type:             runtime.SandboxNone,
+					Policy:           runtime.SandboxDangerFullAccess,
+					WorkingDirectory: "/tmp",
+				},
+				StartTime: time.Now(),
+			}
+
+			resp, err := executor.Execute(ctx, spec, execCtx)
+
+			// Some commands may not be available on all systems
+			if err != nil {
+				toolErr, ok := err.(*runtime.ToolError)
+				if ok && toolErr.Kind == runtime.ErrorExecution {
+					t.Skipf("Command not available: %v", err)
+				}
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			assert.NotNil(t, resp)
+			assert.NotEmpty(t, resp.Content)
+
+			// Verify binary detection matches expectation
+			isBinary := IsBinaryData([]byte(resp.Content))
+			if tt.expectBinary {
+				assert.True(t, isBinary, "Expected binary output but got text")
+			}
+		})
+	}
+}
+
+// TestCommandExecutorExecuteMixedOutput tests commands that produce both text and binary
+func TestCommandExecutorExecuteMixedOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	executor := NewCommandExecutor()
+	ctx := context.Background()
+
+	// Command that outputs text to stderr and binary to stdout
+	spec := &CommandSpec{
+		Command:          []string{"sh", "-c", "echo 'Status: processing' >&2; printf '\\x00\\x01\\x02\\x03'"},
+		WorkingDirectory: "/tmp",
+		CallID:           "test-mixed",
+	}
+
+	execCtx := &runtime.ExecutionContext{
+		SessionID: "test-session",
+		TurnID:    "test-turn",
+		SandboxAttempt: &runtime.SandboxAttempt{
+			Type:             runtime.SandboxNone,
+			Policy:           runtime.SandboxDangerFullAccess,
+			WorkingDirectory: "/tmp",
+		},
+		StartTime: time.Now(),
+	}
+
+	resp, err := executor.Execute(ctx, spec, execCtx)
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+}
+
 // BenchmarkCommandExecutor benchmarks command execution
 func BenchmarkCommandExecutor(b *testing.B) {
 	executor := NewCommandExecutor()
