@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/evmts/codex/codex-go/internal/conversation/manager"
+	"github.com/evmts/codex/codex-go/internal/filesearch"
 	"github.com/evmts/codex/codex-go/internal/input"
 	"github.com/evmts/codex/codex-go/internal/protocol"
 )
@@ -33,6 +34,14 @@ type Model struct {
 	// Tool approval state
 	pendingTool      *PendingToolApproval
 	toolApprovalChan chan bool
+
+	// File search state
+	fileSearchPopup     *FileSearchPopup
+	fileSearchManager   *filesearch.SearchManager
+	fileSearchResultCh  chan filesearch.SearchResultMsg
+	activeAtToken       string
+	dismissedAtToken    string
+	workingDir          string
 
 	// Status
 	model       string
