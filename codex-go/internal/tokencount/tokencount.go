@@ -8,7 +8,6 @@ package tokencount
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/pkoukk/tiktoken-go"
 )
@@ -53,12 +52,12 @@ func (f *fallbackCounter) CountTokens(text string) int {
 // tiktokenCounter wraps a tiktoken encoder for accurate token counting
 type tiktokenCounter struct {
 	encoder *tiktoken.Tiktoken
-	mu      sync.RWMutex
-	cache   map[string]int
+	cache   *LRUCache
 }
 
 // NewTiktokenCounter creates a counter using the specified tiktoken encoding.
 // Returns an error if the encoding cannot be loaded.
+// Uses an LRU cache with 10,000 entries by default for better memory management.
 func NewTiktokenCounter(kind EncodingKind) (TokenCounter, error) {
 	encoder, err := tiktoken.GetEncoding(string(kind))
 	if err != nil {
@@ -67,28 +66,36 @@ func NewTiktokenCounter(kind EncodingKind) (TokenCounter, error) {
 
 	return &tiktokenCounter{
 		encoder: encoder,
-		cache:   make(map[string]int),
+		cache:   NewLRUCache(10000), // Default cache size
 	}, nil
 }
 
-// CountTokens counts tokens using tiktoken encoding with caching
+// NewTiktokenCounterWithCache creates a counter with a custom cache size.
+func NewTiktokenCounterWithCache(kind EncodingKind, cacheSize int) (TokenCounter, error) {
+	encoder, err := tiktoken.GetEncoding(string(kind))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load encoding %s: %w", kind, err)
+	}
+
+	return &tiktokenCounter{
+		encoder: encoder,
+		cache:   NewLRUCache(cacheSize),
+	}, nil
+}
+
+// CountTokens counts tokens using tiktoken encoding with LRU caching
 func (t *tiktokenCounter) CountTokens(text string) int {
-	// Check cache first
-	t.mu.RLock()
-	if count, ok := t.cache[text]; ok {
-		t.mu.RUnlock()
+	// Check cache first (O(1) with LRU)
+	if count, ok := t.cache.Get(text); ok {
 		return count
 	}
-	t.mu.RUnlock()
 
 	// Encode and count tokens
 	tokens := t.encoder.Encode(text, nil, nil)
 	count := len(tokens)
 
 	// Cache the result
-	t.mu.Lock()
-	t.cache[text] = count
-	t.mu.Unlock()
+	t.cache.Put(text, count)
 
 	return count
 }
@@ -134,7 +141,7 @@ func NewCounterForModel(modelName string) (TokenCounter, error) {
 
 	return &tiktokenCounter{
 		encoder: encoder,
-		cache:   make(map[string]int),
+		cache:   NewLRUCache(10000),
 	}, nil
 }
 
