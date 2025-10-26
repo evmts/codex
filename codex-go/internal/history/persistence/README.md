@@ -10,7 +10,43 @@ This package provides history persistence functionality for Codex sessions, hand
 - **Session Management**: Organized in `~/.codex/sessions/{session_id}/`
 - **Resume Support**: Replay Ops/Events from history
 - **Concurrent Safety**: Thread-safe reads and writes
+- **Secure Permissions**: Files created with 0600, directories with 0700
 - **Testing**: Uses `afero.Fs` abstraction for easy testing
+
+## Security
+
+### File Permissions
+
+All history files and session directories are created with restricted permissions to prevent unauthorized access to sensitive conversation data:
+
+- **History Files** (`history.jsonl`, `history.jsonl.*`): Created with mode `0600` (owner read/write only)
+- **Session Directories** (`~/.codex/sessions/{session_id}/`): Created with mode `0700` (owner access only)
+
+**Why This Matters:**
+
+Conversation history may contain sensitive information including:
+- API keys and credentials mentioned in conversations
+- Confidential code or data shared during sessions
+- Personal information discussed with the agent
+- System paths and configuration details
+
+By restricting file permissions to the owner only, we prevent other users on multi-user systems from accessing this sensitive data.
+
+**Implementation:**
+
+The package defines file permission constants that should be used consistently:
+
+```go
+const (
+    // SensitiveFileMode (0600) - owner read/write only
+    SensitiveFileMode os.FileMode = 0600
+
+    // SensitiveDirMode (0700) - owner access only
+    SensitiveDirMode os.FileMode = 0700
+)
+```
+
+These constants are used automatically when creating files and directories through the persistence API.
 
 ## Architecture
 
