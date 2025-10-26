@@ -74,6 +74,7 @@ func NewModel(mgr manager.ConversationManager) Model {
 		width:            80,
 		height:           24,
 		toolApprovalChan: make(chan bool, 1),
+		eventChan:        make(chan *protocol.Event, 100),
 	}
 }
 
