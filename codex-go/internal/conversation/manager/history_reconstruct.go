@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/evmts/codex/codex-go/internal/client"
 	"github.com/evmts/codex/codex-go/internal/protocol"
 )
 
@@ -335,4 +336,39 @@ func ValidateResumedState(state *SessionReconstructedState) error {
 	}
 
 	return nil
+}
+
+// ConvertToClientMessages converts reconstructed conversation messages to client messages.
+// This is used when feeding history to the model on resume.
+func ConvertToClientMessages(convMessages []ConversationMessage) []client.Message {
+	if len(convMessages) == 0 {
+		return nil
+	}
+
+	var messages []client.Message
+	for _, msg := range convMessages {
+		// Skip tool messages as they're typically not included in conversation history for the model
+		// (tool results are, but tool invocations are already in assistant messages)
+		if msg.Role == "tool" {
+			continue
+		}
+
+		// Convert based on role
+		switch msg.Role {
+		case "user":
+			messages = append(messages, client.NewUserMessage(msg.Content))
+
+		case "assistant":
+			messages = append(messages, client.Message{
+				Role:    "assistant",
+				Content: msg.Content,
+			})
+
+		case "tool_result":
+			// Tool results should be formatted as tool messages
+			messages = append(messages, client.NewToolMessage(msg.ToolResultID, msg.Content))
+		}
+	}
+
+	return messages
 }

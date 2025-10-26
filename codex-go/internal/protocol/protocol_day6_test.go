@@ -55,3 +55,248 @@ func TestSandboxPolicy_MarshalJSON(t *testing.T) {
     assert.Equal(t, "native", m["mode"])
 }
 
+func TestEventTypes_MarshalUnmarshal(t *testing.T) {
+    tests := []struct {
+        name  string
+        event *Event
+    }{
+        {
+            name: "EventError",
+            event: &Event{
+                ID: "test-1",
+                Msg: &EventError{
+                    Message: "test error message",
+                },
+            },
+        },
+        {
+            name: "EventTaskStarted",
+            event: &Event{
+                ID: "test-2",
+                Msg: &EventTaskStarted{
+                    ModelContextWindow: int64Ptr(200000),
+                },
+            },
+        },
+        {
+            name: "EventTaskComplete",
+            event: &Event{
+                ID: "test-3",
+                Msg: &EventTaskComplete{
+                    LastAgentMessage: stringPtr("done"),
+                },
+            },
+        },
+        {
+            name: "EventAgentMessage",
+            event: &Event{
+                ID: "test-4",
+                Msg: &EventAgentMessage{
+                    Message: "Hello",
+                },
+            },
+        },
+        {
+            name: "EventAgentMessageDelta",
+            event: &Event{
+                ID: "test-5",
+                Msg: &EventAgentMessageDelta{
+                    Delta: "H",
+                },
+            },
+        },
+        {
+            name: "EventUserMessage",
+            event: &Event{
+                ID: "test-6",
+                Msg: &EventUserMessage{
+                    Message: "test user message",
+                },
+            },
+        },
+        {
+            name: "EventAgentReasoning",
+            event: &Event{
+                ID: "test-7",
+                Msg: &EventAgentReasoning{
+                    Text: "thinking...",
+                },
+            },
+        },
+        {
+            name: "EventAgentReasoningDelta",
+            event: &Event{
+                ID: "test-8",
+                Msg: &EventAgentReasoningDelta{
+                    Delta: "...",
+                },
+            },
+        },
+        {
+            name: "EventExecCommandBegin",
+            event: &Event{
+                ID: "test-9",
+                Msg: &EventExecCommandBegin{
+                    CallID:    "call-1",
+                    Command:   []string{"echo", "test"},
+                    ParsedCmd: []interface{}{"echo", "test"},
+                    Cwd:       "/tmp",
+                },
+            },
+        },
+        {
+            name: "EventExecCommandOutputDelta",
+            event: &Event{
+                ID: "test-10",
+                Msg: &EventExecCommandOutputDelta{
+                    CallID: "call-1",
+                    Stream: "stdout",
+                    Chunk:  []byte("output"),
+                },
+            },
+        },
+        {
+            name: "EventExecCommandEnd",
+            event: &Event{
+                ID: "test-11",
+                Msg: &EventExecCommandEnd{
+                    CallID:           "call-1",
+                    ExitCode:         0,
+                    Duration:         "100ms",
+                    Stdout:           "output",
+                    Stderr:           "",
+                    AggregatedOutput: "output",
+                    FormattedOutput:  "output",
+                },
+            },
+        },
+        {
+            name: "EventTokenCount",
+            event: &Event{
+                ID: "test-12",
+                Msg: &EventTokenCount{
+                    Info: &TokenUsageInfo{
+                        TotalTokenUsage: TokenUsage{
+                            InputTokens:  100,
+                            OutputTokens: 50,
+                            TotalTokens:  150,
+                        },
+                        LastTokenUsage: TokenUsage{
+                            InputTokens:  10,
+                            OutputTokens: 5,
+                            TotalTokens:  15,
+                        },
+                        ModelContextWindow: int64Ptr(200000),
+                    },
+                },
+            },
+        },
+        {
+            name: "EventShutdownComplete",
+            event: &Event{
+                ID:  "test-13",
+                Msg: &EventShutdownComplete{},
+            },
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            data, err := json.Marshal(tt.event)
+            require.NoError(t, err)
+
+            var roundTrip Event
+            err = json.Unmarshal(data, &roundTrip)
+            require.NoError(t, err)
+
+            assert.Equal(t, tt.event.ID, roundTrip.ID)
+            assert.NotNil(t, roundTrip.Msg)
+        })
+    }
+}
+
+func TestOperationTypes_MarshalUnmarshal(t *testing.T) {
+    tests := []struct {
+        name       string
+        submission *Submission
+    }{
+        {
+            name: "OpInterrupt",
+            submission: &Submission{
+                ID: "sub-1",
+                Op: &OpInterrupt{},
+            },
+        },
+        {
+            name: "OpUserInput",
+            submission: &Submission{
+                ID: "sub-2",
+                Op: &OpUserInput{
+                    Items: []UserInput{
+                        {Type: "text", Text: stringPtr("hello")},
+                    },
+                },
+            },
+        },
+        {
+            name: "OpOverrideTurnContext",
+            submission: &Submission{
+                ID: "sub-3",
+                Op: &OpOverrideTurnContext{
+                    Cwd:            stringPtr("/new/path"),
+                    ApprovalPolicy: stringPtr("manual"),
+                    Model:          stringPtr("gpt-4"),
+                },
+            },
+        },
+        {
+            name: "OpExecApproval",
+            submission: &Submission{
+                ID: "sub-4",
+                Op: &OpExecApproval{
+                    ID:       "sub-4",
+                    Decision: "approve",
+                },
+            },
+        },
+        {
+            name: "OpPatchApproval",
+            submission: &Submission{
+                ID: "sub-5",
+                Op: &OpPatchApproval{
+                    ID:       "sub-5",
+                    Decision: "deny",
+                },
+            },
+        },
+        {
+            name: "OpShutdown",
+            submission: &Submission{
+                ID: "sub-6",
+                Op: &OpShutdown{},
+            },
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            data, err := json.Marshal(tt.submission)
+            require.NoError(t, err)
+
+            var roundTrip Submission
+            err = json.Unmarshal(data, &roundTrip)
+            require.NoError(t, err)
+
+            assert.Equal(t, tt.submission.ID, roundTrip.ID)
+            assert.NotNil(t, roundTrip.Op)
+        })
+    }
+}
+
+// Helper functions
+// Note: intPtr and int64Ptr are defined in protocol_test.go
+
+func stringPtr(s string) *string {
+    return &s
+}
+
