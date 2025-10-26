@@ -115,6 +115,55 @@ This project follows **Test-Driven Development (TDD)**:
 - [ ] Error handling and display
 - [ ] Status panels and indicators
 
+## Day 5 Features (Go)
+
+- Multi-turn streaming with tool-results feedback and cumulative token usage.
+- Approval workflow integration (auto/manual/semi-auto) with protocol events.
+- Enhanced history persistence and complete state reconstruction on resume.
+
+### Multi-Turn Streaming
+
+- Tool calls emitted by the model are executed and their results are fed back to the model to generate a final response.
+- Safety guard: a configurable limit prevents infinite multi-turn loops (default: 10).
+
+Example (integration test): see `test/integration/day6_additional_test.go: TestMultiTurn_ThreeRounds`.
+
+### Approval Workflow
+
+- Session-aware approval via `SessionApprovalHandler` bridging orchestrator requests to session state.
+- Emits `tool_call_approval_needed` with risk assessment details.
+- Supports auto/manual/semi-auto policies; manual blocks until approval or cancellation.
+
+Examples:
+- Manual approval happy path: `test/integration/integration_test.go: TestManualApprovalWorkflow`.
+- Cancellation/timeout via context: `test/integration/day6_additional_test.go: TestApprovalCancellationByContext`.
+
+### Persistence & Resume
+
+- All submissions and events are persisted when history is enabled.
+- `ReconstructStateFromHistory` rebuilds conversation, usage, and turn context.
+- Sessions can be resumed and validated before accepting new turns.
+
+Examples:
+- End-to-end persistence: `test/integration/integration_test.go: TestFullSessionWithPersistence`.
+- Interrupted turn resume: `test/integration/day6_additional_test.go: TestResumeFromInterruptedTurn`.
+
+### Validation Commands
+
+```bash
+# Build
+make build
+
+# Run integration tests (subset)
+go test ./test/integration -v
+
+# All packages (can take several minutes)
+go test ./... -count=1
+
+# Race detector (targeted)
+go test -race ./internal/conversation/manager -v
+```
+
 ## CI/CD
 
 GitHub Actions workflow runs on every push:

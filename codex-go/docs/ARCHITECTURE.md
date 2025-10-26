@@ -154,6 +154,40 @@ User Input → Processing → Tool Execution → Assistant Response → Complete
                 ↑__________________|
 ```
 
+Multi-turn flow:
+
+```
+User Input
+  ↓
+Stream assistant deltas
+  ↓
+Output item done → parse tool_calls
+  ↓
+Execute tools (with approval if required) → emit begin/deltas/end
+  ↓
+Append tool results to messages → stream follow-up
+  ↓
+Repeat until no tool_calls or max turns reached
+  ↓
+Emit task_complete + cumulative token usage
+```
+
+Approval workflow:
+
+- Orchestrator requests approval via SessionApprovalHandler, which:
+  - Transitions session to AwaitingApproval
+  - Emits tool_call_approval_needed with risk context
+  - Blocks until SubmitApproval or context cancellation
+  - Denies on concurrent requests to avoid ambiguity
+
+Persistence reconstruction:
+
+- ReconstructStateFromHistory builds:
+  - Conversation history (user/assistant/tool_result)
+  - Token usage (cumulative)
+  - Turn context (cwd, sandbox, approval policy, model)
+  - Stats and validation flags (incomplete/interrupted turns)
+
 #### `internal/history/`
 
 Conversation persistence and loading.
