@@ -46,9 +46,12 @@ func (h *SessionApprovalHandler) HandleApproval(ctx context.Context, req *runtim
 		return runtime.ApprovalApprovedForSession, nil
 	}
 
-	// Check if this should be auto-denied (policy is "never" which shouldn't happen, but be defensive)
+	// Check if approval handler was incorrectly called with "never" policy
+	// "never" policy means the approval handler should not be invoked at all.
+	// If we reach here with "never" policy, it's a configuration error or bug.
+	// We should not blindly approve - instead return an error to surface the issue.
 	if turnCtx.ApprovalPolicy == "never" {
-		return runtime.ApprovalApprovedForSession, nil
+		return runtime.ApprovalDenied, fmt.Errorf("approval handler invoked with 'never' policy - operations should proceed without approval")
 	}
 
 	// For manual and semi-auto policies, we need to request approval

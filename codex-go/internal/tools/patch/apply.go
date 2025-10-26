@@ -24,7 +24,8 @@ type BackupState struct {
 	Path      string
 	Content   []byte
 	Existed   bool
-	Operation string // "update", "add", "delete"
+	Operation string // "update", "add", "delete", "move"
+	DestPath  string // Destination path for move operations
 }
 
 // applyPatches applies a set of patches atomically to the filesystem.
@@ -289,6 +290,7 @@ func applyMoveFile(fs afero.Fs, patch *FilePatch, root string, dryRun bool, back
 		Content:   content,
 		Existed:   true,
 		Operation: "move",
+		DestPath:  newPath,
 	}
 
 	if !dryRun {
@@ -471,11 +473,21 @@ func rollbackChanges(fs afero.Fs, backups []BackupState) error {
 			}
 
 		case "move":
-			// Restore original file and remove new file
-			// This is tricky as we don't have the new path in backup
-			// For now, just restore the original file
+			// Restore original file and remove destination file
 			if err := afero.WriteFile(fs, backup.Path, backup.Content, 0644); err != nil {
 				return fmt.Errorf("failed to restore moved file %s: %w", backup.Path, err)
+			}
+			// Remove destination file if it exists
+			if backup.DestPath != "" {
+				exists, err := afero.Exists(fs, backup.DestPath)
+				if err != nil {
+					return fmt.Errorf("failed to check if destination file %s exists: %w", backup.DestPath, err)
+				}
+				if exists {
+					if err := fs.Remove(backup.DestPath); err != nil {
+						return fmt.Errorf("failed to remove destination file %s: %w", backup.DestPath, err)
+					}
+				}
 			}
 		}
 	}

@@ -74,14 +74,15 @@ type jsonrpcError struct {
 
 // stdioClient implements MCPClient using stdio transport
 type stdioClient struct {
-	config config.MCPServerConfig
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	stderr io.ReadCloser
-	reader *bufio.Reader
-	mu     sync.Mutex
-	nextID int
+	config    config.MCPServerConfig
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	stdout    io.ReadCloser
+	stderr    io.ReadCloser
+	reader    *bufio.Reader
+	mu        sync.Mutex
+	nextID    int
+	stderrBuf strings.Builder // buffer for stderr output
 }
 
 // newStdioClient creates a new stdio-based MCP client
@@ -154,6 +155,25 @@ func (c *stdioClient) initialize(ctx context.Context) error {
 	c.stdout = stdout
 	c.stderr = stderr
 	c.reader = bufio.NewReader(stdout)
+
+	// Start goroutine to consume stderr to prevent deadlock
+	// Stderr must be continuously read or it can fill up the pipe buffer
+	// and cause the child process to block
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				c.mu.Lock()
+				c.stderrBuf.Write(buf[:n])
+				c.mu.Unlock()
+			}
+			if err != nil {
+				// EOF or error means pipe closed, exit goroutine
+				break
+			}
+		}
+	}()
 
 	// Send initialize request
 	initReq := jsonrpcRequest{
@@ -327,16 +347,49 @@ func (c *stdioClient) close() error {
 
 	var errs []error
 
+	// Close stdin first to signal the process we're done
 	if c.stdin != nil {
 		if err := c.stdin.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		c.stdin = nil
 	}
 
-	if c.cmd != nil && c.cmd.Process != nil {
-		if err := c.cmd.Process.Kill(); err != nil {
+	// Close stdout to stop any pending reads
+	if c.stdout != nil {
+		if err := c.stdout.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		c.stdout = nil
+	}
+
+	// Close stderr to stop the consumption goroutine
+	if c.stderr != nil {
+		if err := c.stderr.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		c.stderr = nil
+	}
+
+	// Kill the process if it's still running
+	if c.cmd != nil && c.cmd.Process != nil {
+		if err := c.cmd.Process.Kill(); err != nil {
+			// Ignore "already finished" errors
+			if err.Error() != "os: process already finished" {
+				errs = append(errs, fmt.Errorf("kill process: %w", err))
+			}
+		}
+
+		// Wait for the process to exit to reap the zombie process
+		// This is critical to prevent process leaks
+		if err := c.cmd.Wait(); err != nil {
+			// Ignore exit errors since we just killed the process
+			// We only care that Wait() was called to reap the process
+			// Don't report errors like "signal: killed" or non-zero exit codes
+			// since we intentionally killed the process
+			_ = err // Expected error after kill, ignore it
+		}
+		c.cmd = nil
 	}
 
 	if len(errs) > 0 {

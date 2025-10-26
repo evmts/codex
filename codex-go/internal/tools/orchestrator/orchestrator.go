@@ -83,6 +83,8 @@ func (o *Orchestrator) Execute(
 	}
 
 	// Initialize execution result
+	// Note: StartTime represents when the request was received, not when execution begins.
+	// Actual execution start is tracked at execCtx.StartTime (set just before tool.Execute).
 	result := &runtime.ExecutionResult{
 		Request:   req,
 		StartTime: startTime,
@@ -116,11 +118,13 @@ func (o *Orchestrator) Execute(
 		// Handle approval decision
 		switch decision {
 		case runtime.ApprovalDenied:
+			// Pre-execution rejection - no timing info available yet
 			return nil, &runtime.ToolError{
 				Kind:    runtime.ErrorRejected,
 				Message: "user denied approval",
 			}
 		case runtime.ApprovalAbort:
+			// Pre-execution abort - no timing info available yet
 			return nil, &runtime.ToolError{
 				Kind:    runtime.ErrorRejected,
 				Message: "user aborted operation",
@@ -149,22 +153,34 @@ func (o *Orchestrator) Execute(
 						ctx, tool, req, sandboxAttempt, true, toolErr.Message,
 					)
 					if err != nil {
-						return nil, err
+						// Execution already happened, set end time and return result
+						result.EndTime = time.Now()
+						result.Error = toolErr
+						result.SandboxUsed = execCtx.SandboxAttempt.Type != runtime.SandboxNone
+						return result, err
 					}
 
 					result.ApprovalRequired = true
 
 					switch retryDecision {
 					case runtime.ApprovalDenied:
-						return nil, &runtime.ToolError{
+						// Execution already happened (sandbox attempt), set end time and return result
+						result.EndTime = time.Now()
+						result.Error = &runtime.ToolError{
 							Kind:    runtime.ErrorRejected,
 							Message: "user denied retry approval",
 						}
+						result.SandboxUsed = execCtx.SandboxAttempt.Type != runtime.SandboxNone
+						return result, result.Error
 					case runtime.ApprovalAbort:
-						return nil, &runtime.ToolError{
+						// Execution already happened (sandbox attempt), set end time and return result
+						result.EndTime = time.Now()
+						result.Error = &runtime.ToolError{
 							Kind:    runtime.ErrorRejected,
 							Message: "user aborted retry",
 						}
+						result.SandboxUsed = execCtx.SandboxAttempt.Type != runtime.SandboxNone
+						return result, result.Error
 					case runtime.ApprovalApprovedForSession:
 						o.approvalCache.Put(approvalKey, retryDecision)
 					}
@@ -196,7 +212,8 @@ func (o *Orchestrator) Execute(
 				Cause:   execErr,
 			}
 		}
-		return nil, execErr
+		// Return result with accurate timestamps even on error
+		return result, execErr
 	}
 
 	result.Response = response

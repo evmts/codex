@@ -167,6 +167,13 @@ func NewMCPManager(cfg *config.Config) *MCPManager {
 			continue
 		}
 
+		// Validate server name before creating client
+		if err := validateMCPServerName(name); err != nil {
+			// Skip invalid server names to prevent unsafe tool name construction
+			// This is a configuration error that should be fixed in config.toml
+			continue
+		}
+
 		var client MCPClient
 		if serverCfg.URL != "" {
 			// HTTP transport

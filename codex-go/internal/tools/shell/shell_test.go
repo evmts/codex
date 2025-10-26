@@ -96,11 +96,18 @@ func TestShellToolNeedsInitialApproval(t *testing.T) {
 			wantApproval:   true,
 		},
 		{
-			name:           "normal command with on-request policy",
+			name:           "safe command echo with on-request policy",
 			command:        `{"command": "echo hello"}`,
 			approvalPolicy: runtime.ApprovalOnRequest,
 			sandboxPolicy:  runtime.SandboxReadOnly,
-			wantApproval:   true,
+			wantApproval:   false, // echo is safe, no approval needed
+		},
+		{
+			name:           "unknown command with on-request policy",
+			command:        `{"command": "unknown-cmd"}`,
+			approvalPolicy: runtime.ApprovalOnRequest,
+			sandboxPolicy:  runtime.SandboxReadOnly,
+			wantApproval:   true, // unknown commands need approval
 		},
 	}
 

@@ -119,6 +119,24 @@ func TestConversationState_AddMessage(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "empty content")
 	})
+
+	t.Run("accepts tool role", func(t *testing.T) {
+		state := NewConversationState()
+
+		msg := Message{
+			Role:      "tool",
+			Content:   "Tool execution result",
+			Timestamp: time.Now(),
+		}
+
+		err := state.AddMessage(msg)
+		require.NoError(t, err)
+
+		messages := state.Messages()
+		require.Len(t, messages, 1)
+		assert.Equal(t, "tool", messages[0].Role)
+		assert.Equal(t, "Tool execution result", messages[0].Content)
+	})
 }
 
 func TestConversationState_AddToolCall(t *testing.T) {

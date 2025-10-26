@@ -413,8 +413,13 @@ func TestOrchestratorContextCancellation(t *testing.T) {
 	result, err := orch.Execute(ctx, req, execCtx)
 
 	require.Error(t, err)
-	assert.Nil(t, result)
+	// Result should be returned even on error to capture accurate timestamps
+	require.NotNil(t, result)
+	assert.NotNil(t, result.Error)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded))
+	// Verify timestamps were captured
+	assert.False(t, result.StartTime.IsZero())
+	assert.False(t, result.EndTime.IsZero())
 }
 
 func TestOrchestratorStreamingOutput(t *testing.T) {

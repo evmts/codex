@@ -181,11 +181,17 @@ func runNonInteractive(mgr manager.ConversationManager, message, sessionID, mode
 	// Try to get existing session or create new one
 	sess, err := mgr.GetSession(sessionID)
 	if err != nil || sess == nil {
+		// Get absolute path for current directory
+		cwd, cwdErr := os.Getwd()
+		if cwdErr != nil {
+			cwd = "." // Fallback to relative path
+		}
+
 		// Create new session with event handler
 		sess, err = mgr.CreateSession(ctx, manager.SessionConfig{
 			ID: sessionID,
 			TurnContext: &manager.TurnContext{
-				Cwd:            ".",
+				Cwd:            cwd,
 				ApprovalPolicy: "auto",
 				SandboxPolicy:  protocol.SandboxPolicy{Mode: "native"},
 				Model:          model,

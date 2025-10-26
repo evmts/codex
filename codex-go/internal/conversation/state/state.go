@@ -90,7 +90,7 @@ func NewConversationState() *ConversationState {
 // This method is thread-safe.
 func (s *ConversationState) AddMessage(msg Message) error {
 	// Validate message
-	if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "system" {
+	if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "system" && msg.Role != "tool" {
 		return fmt.Errorf("invalid role: %s", msg.Role)
 	}
 	if msg.Content == "" {

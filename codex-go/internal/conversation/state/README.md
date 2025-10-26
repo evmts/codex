@@ -183,12 +183,18 @@ enforcer.ClearViolations()
 ### Message
 ```go
 type Message struct {
-    Role      string    // "user", "assistant", "system"
+    Role      string    // "user", "assistant", "system", "tool"
     Content   string    // Message content
     Timestamp time.Time // When message was created
     ID        string    // Optional unique identifier
 }
 ```
+
+**Supported Roles:**
+- `user`: Messages from the user
+- `assistant`: Messages from the AI assistant
+- `system`: System-level instructions or messages
+- `tool`: Tool execution results (OpenAI API compatible)
 
 ### ToolCall
 ```go

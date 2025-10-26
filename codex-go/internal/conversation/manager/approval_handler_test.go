@@ -246,3 +246,49 @@ func TestSessionApprovalHandler_DefaultApprovalTimeout(t *testing.T) {
     assert.Contains(t, err.Error(), "context deadline exceeded")
 }
 
+func TestSessionApprovalHandler_NeverPolicyRejectsInvocation(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    mockClient := mocks.NewMockClient(ctrl)
+
+    // Create session with "never" approval policy
+    sess := createTestSession(t, mockClient)
+    op := &protocol.OpUserTurn{
+        Items:          []protocol.UserInput{{Type: "text", Text: strPtr("hello")}},
+        Cwd:            ".",
+        ApprovalPolicy: "never",
+        SandboxPolicy:  protocol.SandboxPolicy{Mode: "native"},
+        Model:          "gpt-4",
+    }
+    submissionID, err := sess.SubmitTurn(context.Background(), op)
+    require.NoError(t, err)
+
+    // Collect events to ensure no approval-needed event is emitted
+    var gotApprovalEvent bool
+    handler := func(ctx context.Context, e *protocol.Event) error {
+        if _, ok := e.Msg.(*protocol.EventToolCallApprovalNeeded); ok {
+            gotApprovalEvent = true
+        }
+        return nil
+    }
+    sess.eventHandlers = append(sess.eventHandlers, handler)
+
+    // Create approval handler
+    sah := NewSessionApprovalHandler(sess, submissionID)
+
+    // Invoke HandleApproval with any request
+    // With "never" policy, the approval handler should NOT have been called at all
+    // Since it was called anyway (defensive check), it should return an error
+    req := &runtime.ApprovalRequest{CallID: "call-never", ToolName: "shell", Command: []string{"rm", "-rf", "/"}}
+    decision, err := sah.HandleApproval(context.Background(), req)
+
+    // Expect error since approval handler shouldn't be invoked with "never" policy
+    require.Error(t, err)
+    assert.Contains(t, err.Error(), "never")
+    assert.Equal(t, runtime.ApprovalDenied, decision)
+    assert.False(t, gotApprovalEvent, "never policy should not emit approval needed event")
+    // State should remain processing (not transition to awaiting approval)
+    assert.Equal(t, StateProcessingTurn, sess.State())
+}
+

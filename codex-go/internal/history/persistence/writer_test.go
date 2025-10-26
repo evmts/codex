@@ -251,3 +251,44 @@ func TestHistoryWriterPath(t *testing.T) {
 
 	assert.Equal(t, "/test/history.jsonl", writer.Path())
 }
+
+func TestHistoryWriterFilePermissions(t *testing.T) {
+	// Use OS filesystem to verify real permissions
+	fs := afero.NewOsFs()
+
+	// Create temp directory for test - use a subdirectory so we can control permissions
+	tempDir := t.TempDir()
+	sessionDir := tempDir + "/test-session"
+	historyPath := sessionDir + "/history.jsonl"
+
+	// Create writer - this should create the session directory with 0700
+	writer, err := NewHistoryWriter(fs, historyPath)
+	require.NoError(t, err)
+	defer writer.Close()
+
+	// Write some data
+	submission := &protocol.Submission{
+		ID: "perm-test",
+		Op: &protocol.OpInterrupt{},
+	}
+	err = writer.Append(submission)
+	require.NoError(t, err)
+
+	// Verify file permissions
+	info, err := fs.Stat(historyPath)
+	require.NoError(t, err)
+
+	// Check file mode is 0600 (owner read/write only)
+	mode := info.Mode()
+	assert.Equal(t, SensitiveFileMode, mode.Perm(),
+		"history file should have 0600 permissions to prevent unauthorized access")
+
+	// Verify directory permissions - check the directory we created
+	dirInfo, err := fs.Stat(sessionDir)
+	require.NoError(t, err)
+
+	// Directory should have 0700 permissions (owner only)
+	dirMode := dirInfo.Mode()
+	assert.Equal(t, SensitiveDirMode, dirMode.Perm(),
+		"session directory should have 0700 permissions to protect sensitive data")
+}

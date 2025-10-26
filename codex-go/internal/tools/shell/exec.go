@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -55,10 +54,17 @@ func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCt
 		cmd.Dir = spec.WorkingDirectory
 	}
 
-	// Set environment variables
+	// Set environment variables with filtering to prevent credential leakage
 	if len(spec.Environment) > 0 {
-		cmd.Env = os.Environ()
-		for k, v := range spec.Environment {
+		// Create filter to remove sensitive environment variables
+		filter := NewDefaultEnvFilter()
+
+		// Start with filtered system environment
+		cmd.Env = filter.Filter()
+
+		// Add user-specified environment variables (also filtered for safety)
+		filteredEnv := filter.FilterMap(spec.Environment)
+		for k, v := range filteredEnv {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 		}
 	}

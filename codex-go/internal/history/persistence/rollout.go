@@ -14,6 +14,8 @@ import (
 // CreateRollout creates a timestamped snapshot of the history file.
 // The rollout file is named "{basename}.{timestamp}" (e.g., history.jsonl.1234567890).
 // Returns the path to the created rollout file.
+// Rollout files are created with SensitiveFileMode (0600) to maintain the same
+// security posture as the original history file.
 func CreateRollout(fs afero.Fs, historyPath string) (string, error) {
 	// Check if source file exists
 	exists, err := afero.Exists(fs, historyPath)
@@ -33,7 +35,8 @@ func CreateRollout(fs afero.Fs, historyPath string) (string, error) {
 		return "", fmt.Errorf("failed to read history file: %w", err)
 	}
 
-	if err := afero.WriteFile(fs, rolloutPath, data, 0644); err != nil {
+	// Write rollout with restricted permissions to protect sensitive data
+	if err := afero.WriteFile(fs, rolloutPath, data, SensitiveFileMode); err != nil {
 		return "", fmt.Errorf("failed to write rollout file: %w", err)
 	}
 

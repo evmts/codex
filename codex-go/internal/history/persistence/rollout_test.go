@@ -378,3 +378,45 @@ func TestIsRolloutFile(t *testing.T) {
 		})
 	}
 }
+
+func TestRolloutFilePermissions(t *testing.T) {
+	// Use OS filesystem to verify real permissions
+	fs := afero.NewOsFs()
+
+	// Create temp directory for test
+	tempDir := t.TempDir()
+	historyPath := filepath.Join(tempDir, "history.jsonl")
+
+	// Create initial history file
+	writer, err := NewHistoryWriter(fs, historyPath)
+	require.NoError(t, err)
+
+	err = writer.Append(&protocol.Submission{ID: "rollout-perm-test", Op: &protocol.OpInterrupt{}})
+	require.NoError(t, err)
+	err = writer.Close()
+	require.NoError(t, err)
+
+	// Create rollout
+	rolloutPath, err := CreateRollout(fs, historyPath)
+	require.NoError(t, err)
+	require.NotEmpty(t, rolloutPath)
+
+	// Verify rollout file permissions
+	info, err := fs.Stat(rolloutPath)
+	require.NoError(t, err)
+
+	// Check file mode is 0600 (owner read/write only)
+	mode := info.Mode()
+	assert.Equal(t, SensitiveFileMode, mode.Perm(),
+		"rollout file should have 0600 permissions to protect sensitive conversation history")
+
+	// Verify the rollout file content matches the original
+	originalData, err := afero.ReadFile(fs, historyPath)
+	require.NoError(t, err)
+
+	rolloutData, err := afero.ReadFile(fs, rolloutPath)
+	require.NoError(t, err)
+
+	assert.Equal(t, originalData, rolloutData,
+		"rollout should be an exact copy of the history file")
+}

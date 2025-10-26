@@ -66,6 +66,24 @@ func TestMessageHistory_Append(t *testing.T) {
 		assert.Error(t, err)
 		assert.Equal(t, 0, history.Count())
 	})
+
+	t.Run("accepts tool role", func(t *testing.T) {
+		history := NewMessageHistory()
+
+		msg := Message{
+			Role:      "tool",
+			Content:   "Tool execution result",
+			Timestamp: time.Now(),
+		}
+
+		err := history.Append(msg)
+		require.NoError(t, err)
+		assert.Equal(t, 1, history.Count())
+
+		messages := history.All()
+		assert.Equal(t, "tool", messages[0].Role)
+		assert.Equal(t, "Tool execution result", messages[0].Content)
+	})
 }
 
 func TestMessageHistory_GetByRole(t *testing.T) {

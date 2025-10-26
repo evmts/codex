@@ -1,6 +1,7 @@
 package protocol
 
 import (
+    "encoding/base64"
     "encoding/json"
     "testing"
 
@@ -151,7 +152,7 @@ func TestEventTypes_MarshalUnmarshal(t *testing.T) {
                 Msg: &EventExecCommandOutputDelta{
                     CallID: "call-1",
                     Stream: "stdout",
-                    Chunk:  []byte("output"),
+                    Chunk:  "b3V0cHV0", // base64 encoded "output"
                 },
             },
         },
@@ -298,5 +299,78 @@ func TestOperationTypes_MarshalUnmarshal(t *testing.T) {
 
 func stringPtr(s string) *string {
     return &s
+}
+
+// TestEventExecCommandOutputDelta_BinaryData tests that binary data is properly base64 encoded
+func TestEventExecCommandOutputDelta_BinaryData(t *testing.T) {
+    tests := []struct {
+        name       string
+        binaryData []byte
+        wantChunk  string // expected base64 encoded value
+    }{
+        {
+            name:       "null bytes",
+            binaryData: []byte{0x00, 0x01, 0x02, 0x03},
+            wantChunk:  "AAECAw==",
+        },
+        {
+            name:       "non-UTF8 data",
+            binaryData: []byte{0xFF, 0xFE, 0xFD, 0xFC},
+            wantChunk:  "//79/A==",
+        },
+        {
+            name:       "mixed ASCII and binary",
+            binaryData: []byte("hello\x00world\xFF"),
+            wantChunk:  "aGVsbG8Ad29ybGT/",
+        },
+        {
+            name:       "empty data",
+            binaryData: []byte{},
+            wantChunk:  "",
+        },
+        {
+            name:       "regular text",
+            binaryData: []byte("output"),
+            wantChunk:  "b3V0cHV0",
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            // Create event with base64 encoded chunk
+            encoded := base64.StdEncoding.EncodeToString(tt.binaryData)
+            assert.Equal(t, tt.wantChunk, encoded, "base64 encoding mismatch")
+
+            event := &Event{
+                ID: "test-binary",
+                Msg: &EventExecCommandOutputDelta{
+                    CallID: "call-1",
+                    Stream: "stdout",
+                    Chunk:  encoded,
+                },
+            }
+
+            // Marshal to JSON
+            data, err := json.Marshal(event)
+            require.NoError(t, err)
+
+            // Unmarshal back
+            var roundTrip Event
+            err = json.Unmarshal(data, &roundTrip)
+            require.NoError(t, err)
+
+            // Verify the event
+            outputDelta, ok := roundTrip.Msg.(*EventExecCommandOutputDelta)
+            require.True(t, ok)
+            assert.Equal(t, "call-1", outputDelta.CallID)
+            assert.Equal(t, "stdout", outputDelta.Stream)
+            assert.Equal(t, encoded, outputDelta.Chunk)
+
+            // Decode and verify original data
+            decoded, err := base64.StdEncoding.DecodeString(outputDelta.Chunk)
+            require.NoError(t, err)
+            assert.Equal(t, tt.binaryData, decoded)
+        })
+    }
 }
 

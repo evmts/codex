@@ -2,8 +2,12 @@ package manager
 
 import (
     "context"
+    "encoding/base64"
     "encoding/json"
     "fmt"
+    "os"
+    "path/filepath"
+    "strings"
     "time"
 
     "github.com/evmts/codex/codex-go/internal/client"
@@ -90,10 +94,43 @@ func (tp *TurnProcessor) buildRequest(op *protocol.OpUserTurn) (*client.ChatComp
 	}
 
 	// Add user message from current turn
+	// Collect all items and combine them into a single message
+	var userContent strings.Builder
+	var hasContent bool
+
 	for _, item := range op.Items {
 		if item.Type == "text" && item.Text != nil {
-			messages = append(messages, client.NewUserMessage(*item.Text))
+			if hasContent {
+				userContent.WriteString("\n\n")
+			}
+			userContent.WriteString(*item.Text)
+			hasContent = true
+		} else if item.Type == "path" && item.Path != nil {
+			// Read and include file content
+			content, err := os.ReadFile(*item.Path)
+			if err != nil {
+				// Include error message in context
+				if hasContent {
+					userContent.WriteString("\n\n")
+				}
+				userContent.WriteString(fmt.Sprintf("[Error reading file %s: %v]", filepath.Base(*item.Path), err))
+				hasContent = true
+				continue
+			}
+
+			// Format file content for LLM
+			if hasContent {
+				userContent.WriteString("\n\n")
+			}
+			userContent.WriteString(fmt.Sprintf("[File: %s]\n%s\n[End File: %s]",
+				filepath.Base(*item.Path), string(content), filepath.Base(*item.Path)))
+			hasContent = true
 		}
+	}
+
+	// Add the combined user message
+	if hasContent {
+		messages = append(messages, client.NewUserMessage(userContent.String()))
 	}
 
 	// Build request
@@ -524,14 +561,18 @@ func (tp *TurnProcessor) executeToolCalls(ctx context.Context, submissionID stri
         writer := runtime.NewStreamWriter(call.ID, func(delta runtime.OutputDelta) {
             switch delta.Type {
             case runtime.DeltaStdout:
+                // Encode binary data as base64 to prevent corruption
+                encoded := base64.StdEncoding.EncodeToString([]byte(delta.Content))
                 _ = tp.session.EmitEvent(ctx, &protocol.Event{ // nolint:errcheck
                     ID: submissionID,
-                    Msg: &protocol.EventExecCommandOutputDelta{CallID: call.ID, Stream: "stdout", Chunk: []byte(delta.Content)},
+                    Msg: &protocol.EventExecCommandOutputDelta{CallID: call.ID, Stream: "stdout", Chunk: encoded},
                 })
             case runtime.DeltaStderr:
+                // Encode binary data as base64 to prevent corruption
+                encoded := base64.StdEncoding.EncodeToString([]byte(delta.Content))
                 _ = tp.session.EmitEvent(ctx, &protocol.Event{ // nolint:errcheck
                     ID: submissionID,
-                    Msg: &protocol.EventExecCommandOutputDelta{CallID: call.ID, Stream: "stderr", Chunk: []byte(delta.Content)},
+                    Msg: &protocol.EventExecCommandOutputDelta{CallID: call.ID, Stream: "stderr", Chunk: encoded},
                 })
             default:
                 // Ignore status/complete here

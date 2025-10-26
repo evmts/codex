@@ -378,22 +378,219 @@ func (s *StreamWriter) Close() error {
 	return nil
 }
 
+// Shell Command Security Parser
+//
+// This section implements a security-critical parser that extracts actual commands
+// from shell-wrapped command arrays. This addresses a security vulnerability where
+// safety checks would only see "sh" instead of the actual commands being executed.
+//
+// SECURITY CONTEXT:
+// Commands in codex-go are wrapped as ["sh", "-c", "command string"] to support
+// shell features like pipes, redirects, and command chaining. Without parsing,
+// the safety checks (IsKnownSafeCommand, IsDangerousCommand) would only examine
+// "sh" and incorrectly classify all shell-wrapped commands as unknown/unsafe.
+//
+// PARSER CAPABILITIES:
+// - Extracts command programs from shell strings (ignoring arguments)
+// - Handles shell operators: &&, ||, ;, | (command separators)
+// - Handles quotes: single ('), double ("), and backticks (`)
+// - Handles escape sequences: backslash (\)
+// - Handles redirects: >, >>, <, 2>, 2>&1, etc.
+// - Handles background processes: &
+//
+// LIMITATIONS:
+// - Does not parse commands inside backticks (command substitution)
+// - Does not parse commands inside $() (command substitution)
+// - Assumes well-formed shell syntax (no syntax error checking)
+//
+// EXAMPLE TRANSFORMATIONS:
+// - ["sh", "-c", "ls"] -> ["ls"]
+// - ["sh", "-c", "ls && echo hi"] -> ["ls", "echo"]
+// - ["sh", "-c", "ls | grep test"] -> ["ls", "grep"]
+// - ["sh", "-c", "ls && rm file"] -> ["ls", "rm"]
+// - ["sh", "-c", "echo 'ls && rm'"] -> ["echo"] (quotes protect operators)
+
+// parseShellCommand extracts actual commands from shell-wrapped command arrays.
+// When commands are wrapped in "sh -c <command>", this parser extracts and validates
+// all commands within the shell string, handling operators like &&, ||, ;, and |.
+//
+// Returns a slice of command programs found in the shell string.
+// For example: ["sh", "-c", "ls && echo hi"] returns ["ls", "echo"]
+func parseShellCommand(command []string) []string {
+	if len(command) == 0 {
+		return nil
+	}
+
+	// Check if this is a shell-wrapped command (sh/bash -c "...")
+	if len(command) >= 3 && (command[0] == "sh" || command[0] == "bash") && command[1] == "-c" {
+		// Extract the actual shell command string
+		shellCmd := command[2]
+		return extractCommandsFromShellString(shellCmd)
+	}
+
+	// Not shell-wrapped, return the program name
+	return []string{command[0]}
+}
+
+// extractCommandsFromShellString parses a shell command string and extracts
+// all command programs (not their arguments), handling shell operators and quoting.
+func extractCommandsFromShellString(shellCmd string) []string {
+	var commands []string
+	var currentToken []rune
+	var inSingleQuote, inDoubleQuote, inBacktick bool
+	var escaped bool
+	var expectingCommand bool = true // Track if next token should be a command
+
+	// Helper to flush current token
+	flushToken := func() {
+		if len(currentToken) > 0 {
+			token := string(currentToken)
+			// Only add if it looks like a command (not an operator or empty)
+			// and we're expecting a command (not an argument)
+			if token != "" && !isShellOperator(token) && expectingCommand {
+				commands = append(commands, token)
+				expectingCommand = false // Next tokens are arguments, not commands
+			}
+			currentToken = nil
+		}
+	}
+
+	runes := []rune(shellCmd)
+	for i := 0; i < len(runes); i++ {
+		ch := runes[i]
+
+		// Handle escape sequences
+		if escaped {
+			currentToken = append(currentToken, ch)
+			escaped = false
+			continue
+		}
+
+		if ch == '\\' && !inSingleQuote {
+			escaped = true
+			continue
+		}
+
+		// Handle quotes
+		if ch == '\'' && !inDoubleQuote && !inBacktick {
+			inSingleQuote = !inSingleQuote
+			continue
+		}
+		if ch == '"' && !inSingleQuote && !inBacktick {
+			inDoubleQuote = !inDoubleQuote
+			continue
+		}
+		if ch == '`' && !inSingleQuote && !inDoubleQuote {
+			inBacktick = !inBacktick
+			continue
+		}
+
+		// If we're inside quotes, just accumulate
+		if inSingleQuote || inDoubleQuote || inBacktick {
+			currentToken = append(currentToken, ch)
+			continue
+		}
+
+		// Handle shell operators and whitespace outside quotes
+		if ch == ' ' || ch == '\t' || ch == '\n' {
+			flushToken()
+			continue
+		}
+
+		// Check for multi-character operators
+		if ch == '&' && i+1 < len(runes) && runes[i+1] == '&' {
+			flushToken()
+			expectingCommand = true // After operator, expect new command
+			i++                     // Skip next &
+			continue
+		}
+		if ch == '|' && i+1 < len(runes) && runes[i+1] == '|' {
+			flushToken()
+			expectingCommand = true // After operator, expect new command
+			i++                     // Skip next |
+			continue
+		}
+
+		// Single character operators
+		if ch == ';' || ch == '|' || ch == '&' {
+			flushToken()
+			expectingCommand = true // After operator, expect new command
+			continue
+		}
+
+		// Redirect operators - don't trigger new command expectation
+		// Handle complex redirects like 2>&1, 2>>, etc.
+		if ch == '>' || ch == '<' {
+			flushToken()
+			// Skip the rest of the redirect pattern (e.g., >&1, >>)
+			if ch == '>' && i+1 < len(runes) {
+				if runes[i+1] == '>' || runes[i+1] == '&' {
+					i++ // Skip next character
+					if i+1 < len(runes) && runes[i] == '&' && (runes[i+1] >= '0' && runes[i+1] <= '9') {
+						i++ // Skip the digit
+					}
+				}
+			}
+			continue
+		}
+
+		// Handle numeric file descriptor redirects (e.g., 2>)
+		if ch >= '0' && ch <= '9' && i+1 < len(runes) && (runes[i+1] == '>' || runes[i+1] == '<') {
+			flushToken()
+			i++ // Skip the redirect operator
+			// Handle >> or >&
+			if i+1 < len(runes) && (runes[i+1] == '>' || runes[i+1] == '&') {
+				i++ // Skip next character
+				if i+1 < len(runes) && runes[i] == '&' && (runes[i+1] >= '0' && runes[i+1] <= '9') {
+					i++ // Skip the digit
+				}
+			}
+			continue
+		}
+
+		// Regular character, add to current token
+		currentToken = append(currentToken, ch)
+	}
+
+	// Flush any remaining token
+	flushToken()
+
+	return commands
+}
+
+// isShellOperator checks if a token is a shell operator
+func isShellOperator(token string) bool {
+	operators := map[string]bool{
+		"&&": true, "||": true, ";": true, "|": true,
+		"&": true, ">": true, ">>": true, "<": true,
+		"2>": true, "2>>": true, "2>&1": true,
+	}
+	return operators[token]
+}
+
 // IsKnownSafeCommand determines if a command is considered safe to execute
-// without approval or sandbox restrictions. This is a placeholder for
-// command safety analysis logic.
+// without approval or sandbox restrictions. This function now properly handles
+// shell-wrapped commands by parsing the actual commands from shell strings.
+//
+// For shell-wrapped commands (sh -c "..."), it extracts and validates all
+// commands in the shell string. If any command is not safe, returns false.
+//
+// TODO: Implement argument-aware validation to allow safe command usage
+// (e.g., allow "find . -name '*.txt'" but block "find . -delete")
 func IsKnownSafeCommand(command []string) bool {
 	if len(command) == 0 {
 		return false
 	}
 
 	// List of commands that are generally safe (read-only operations)
+	// Note: "find" is NOT in this list because it has dangerous options:
+	// -delete, -exec, -ok, -execdir that can destroy data or execute arbitrary commands
 	safeCommands := map[string]bool{
 		"ls":     true,
 		"pwd":    true,
 		"echo":   true,
 		"cat":    true,
 		"grep":   true,
-		"find":   true,
 		"which":  true,
 		"type":   true,
 		"head":   true,
@@ -407,13 +604,26 @@ func IsKnownSafeCommand(command []string) bool {
 		"stat":   true,
 	}
 
-	program := command[0]
-	return safeCommands[program]
+	// Parse the command to extract actual programs
+	programs := parseShellCommand(command)
+
+	// All extracted commands must be safe
+	for _, program := range programs {
+		if !safeCommands[program] {
+			return false
+		}
+	}
+
+	// If we found at least one command and all were safe, return true
+	return len(programs) > 0
 }
 
 // IsDangerousCommand determines if a command is potentially dangerous
-// and should always require approval. This is a placeholder for
-// command risk analysis logic.
+// and should always require approval. This function now properly handles
+// shell-wrapped commands by parsing the actual commands from shell strings.
+//
+// For shell-wrapped commands (sh -c "..."), it extracts and checks all
+// commands in the shell string. If any command is dangerous, returns true.
 func IsDangerousCommand(command []string) bool {
 	if len(command) == 0 {
 		return false
@@ -440,6 +650,15 @@ func IsDangerousCommand(command []string) bool {
 		"systemctl": true,
 	}
 
-	program := command[0]
-	return dangerousCommands[program]
+	// Parse the command to extract actual programs
+	programs := parseShellCommand(command)
+
+	// Check if any extracted command is dangerous
+	for _, program := range programs {
+		if dangerousCommands[program] {
+			return true
+		}
+	}
+
+	return false
 }

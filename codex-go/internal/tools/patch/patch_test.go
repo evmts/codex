@@ -434,6 +434,69 @@ func TestApplyPatch_HunkMismatch_Rollback(t *testing.T) {
 	assert.Contains(t, strings.Join(result.Errors, " "), "conflict")
 }
 
+func TestApplyPatch_MoveFile_Rollback(t *testing.T) {
+	fs := test.NewMemFS(t)
+	originalContent := "original content\n"
+	test.WriteFileFS(t, fs, "/workspace/source.txt", []byte(originalContent))
+	test.WriteFileFS(t, fs, "/workspace/other.txt", []byte("other file\n"))
+
+	// Patch that moves source.txt to dest.txt, then tries to update other.txt with invalid content
+	// This will cause rollback to restore source.txt and remove dest.txt
+	diff := `--- a/source.txt
++++ b/dest.txt
+@@ -1 +1 @@
+ original content
+--- a/other.txt
++++ b/other.txt
+@@ -1 +1 @@
+-other file
++wrong content
+`
+	patches, err := parseUnifiedDiff(diff)
+	require.NoError(t, err)
+
+	// Modify other.txt content to cause a conflict
+	test.WriteFileFS(t, fs, "/workspace/other.txt", []byte("different content\n"))
+
+	result, err := applyPatches(fs, patches, "/workspace", false)
+	require.Error(t, err)
+	require.NotNil(t, result)
+
+	// Should have rolled back - source file should be restored
+	test.AssertFileExistsFS(t, fs, "/workspace/source.txt")
+	content := test.ReadFileFS(t, fs, "/workspace/source.txt")
+	assert.Equal(t, originalContent, string(content))
+
+	// Destination file should be removed (rollback)
+	test.AssertFileNotExistsFS(t, fs, "/workspace/dest.txt")
+}
+
+func TestApplyPatch_MoveFile_RollbackDestinationAlreadyRemoved(t *testing.T) {
+	fs := test.NewMemFS(t)
+	originalContent := "original content\n"
+	test.WriteFileFS(t, fs, "/workspace/source.txt", []byte(originalContent))
+
+	// Create a backup manually to simulate a scenario where destination doesn't exist
+	backups := []BackupState{
+		{
+			Path:      "/workspace/source.txt",
+			Content:   []byte(originalContent),
+			Existed:   true,
+			Operation: "move",
+			DestPath:  "/workspace/dest.txt",
+		},
+	}
+
+	// Rollback should handle case where destination doesn't exist gracefully
+	err := rollbackChanges(fs, backups)
+	require.NoError(t, err)
+
+	// Source file should be restored
+	test.AssertFileExistsFS(t, fs, "/workspace/source.txt")
+	content := test.ReadFileFS(t, fs, "/workspace/source.txt")
+	assert.Equal(t, originalContent, string(content))
+}
+
 func TestApplyPatch_DryRun(t *testing.T) {
 	fs := test.NewMemFS(t)
 	test.WriteFileFS(t, fs, "/workspace/file.txt", []byte("old content\n"))

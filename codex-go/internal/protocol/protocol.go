@@ -19,6 +19,13 @@ const (
 	UserMessageBegin           = "## My request for Codex:"
 )
 
+// Constants for UserInput types
+const (
+	UserInputTypeText     = "text"
+	UserInputTypeImageURL = "image_url"
+	UserInputTypePath     = "path"
+)
+
 // Submission represents a request from the user to the agent.
 // It wraps an Op with a unique ID for correlation with events.
 type Submission struct {
@@ -536,10 +543,11 @@ func (e *EventExecCommandBegin) MarshalJSON() ([]byte, error) {
 }
 
 // EventExecCommandOutputDelta represents incremental output from a running command.
+// Chunk contains base64-encoded binary data to prevent corruption during JSON serialization.
 type EventExecCommandOutputDelta struct {
 	CallID string `json:"call_id"`
 	Stream string `json:"stream"`
-	Chunk  []byte `json:"chunk"`
+	Chunk  string `json:"chunk"` // base64 encoded binary data
 }
 
 func (e *EventExecCommandOutputDelta) EventType() string { return "exec_command_output_delta" }

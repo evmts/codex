@@ -35,9 +35,11 @@ type HistoryPersistence struct {
 // NewHistoryPersistence creates a new HistoryPersistence for the given session directory.
 // The session directory should be the full path to the session (e.g., ~/.codex/sessions/session-id).
 // It creates the directory if it doesn't exist and opens the history file for writing.
+// Directories are created with SensitiveDirMode (0700) to protect sensitive session data.
 func NewHistoryPersistence(fs afero.Fs, sessionDir string) (*HistoryPersistence, error) {
 	// Create session directory if it doesn't exist
-	if err := fs.MkdirAll(sessionDir, 0755); err != nil {
+	// Use 0700 to ensure only the owner can access session data
+	if err := fs.MkdirAll(sessionDir, SensitiveDirMode); err != nil {
 		return nil, fmt.Errorf("failed to create session directory: %w", err)
 	}
 

@@ -87,26 +87,12 @@ func (e *ExecutionEngine) ExecuteParallel(
 				// Execute the tool
 				result, err := orchestrator.Execute(ctx, request, clonedExecCtx)
 
-				// Store result
+				// Store result - orchestrator.Execute now returns result even on error
+				// to ensure accurate timestamp capture. Timestamps are recorded during
+				// actual execution (inside orchestrator.Execute), not during aggregation.
 				resultsMu.Lock()
 				if result != nil {
 					results[indexMap[request.CallID]] = result
-				} else if err != nil {
-					// Create error result
-					toolErr, ok := err.(*runtime.ToolError)
-					if !ok {
-						toolErr = &runtime.ToolError{
-							Kind:    runtime.ErrorExecution,
-							Message: err.Error(),
-							Cause:   err,
-						}
-					}
-					results[indexMap[request.CallID]] = &runtime.ExecutionResult{
-						Request:   request,
-						Error:     toolErr,
-						StartTime: time.Now(),
-						EndTime:   time.Now(),
-					}
 				}
 				resultsMu.Unlock()
 
@@ -140,25 +126,12 @@ func (e *ExecutionEngine) ExecuteParallel(
 				// Execute sequentially
 				result, err := orchestrator.Execute(ctx, req, clonedExecCtx)
 
-				// Store result
+				// Store result - orchestrator.Execute now returns result even on error
+				// to ensure accurate timestamp capture. Timestamps are recorded during
+				// actual execution (inside orchestrator.Execute), not during aggregation.
 				resultsMu.Lock()
 				if result != nil {
 					results[indexMap[req.CallID]] = result
-				} else if err != nil {
-					toolErr, ok := err.(*runtime.ToolError)
-					if !ok {
-						toolErr = &runtime.ToolError{
-							Kind:    runtime.ErrorExecution,
-							Message: err.Error(),
-							Cause:   err,
-						}
-					}
-					results[indexMap[req.CallID]] = &runtime.ExecutionResult{
-						Request:   req,
-						Error:     toolErr,
-						StartTime: time.Now(),
-						EndTime:   time.Now(),
-					}
 				}
 				resultsMu.Unlock()
 
@@ -202,26 +175,13 @@ func (e *ExecutionEngine) ExecuteSequential(
 		clonedExecCtx := e.cloneExecutionContext(execCtx)
 
 		// Execute the tool
-		result, err := orchestrator.Execute(ctx, req, clonedExecCtx)
+		result, _ := orchestrator.Execute(ctx, req, clonedExecCtx)
 
+		// Append result - orchestrator.Execute now returns result even on error
+		// to ensure accurate timestamp capture. Timestamps are recorded during
+		// actual execution (inside orchestrator.Execute), not during aggregation.
 		if result != nil {
 			results = append(results, result)
-		} else if err != nil {
-			// Create error result
-			toolErr, ok := err.(*runtime.ToolError)
-			if !ok {
-				toolErr = &runtime.ToolError{
-					Kind:    runtime.ErrorExecution,
-					Message: err.Error(),
-					Cause:   err,
-				}
-			}
-			results = append(results, &runtime.ExecutionResult{
-				Request:   req,
-				Error:     toolErr,
-				StartTime: time.Now(),
-				EndTime:   time.Now(),
-			})
 		}
 
 		// Continue executing remaining tools even if one fails

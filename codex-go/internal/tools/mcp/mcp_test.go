@@ -1,11 +1,14 @@
 package mcp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -529,6 +532,147 @@ func TestMCPManager(t *testing.T) {
 	})
 }
 
+// TestToolNameTruncation tests tool name length validation and truncation
+func TestToolNameTruncation(t *testing.T) {
+	t.Run("short name unchanged", func(t *testing.T) {
+		shortName := "mcp__server__tool"
+		result := truncateToolName(shortName)
+		assert.Equal(t, shortName, result)
+		assert.LessOrEqual(t, len(result), MaxToolNameLength)
+	})
+
+	t.Run("exact 64 char name unchanged", func(t *testing.T) {
+		// Create a name exactly 64 characters long
+		exactName := "mcp__server__tool_with_a_very_long_name_that_is_exactly_64xxxxxx"
+		require.Equal(t, 64, len(exactName))
+		result := truncateToolName(exactName)
+		assert.Equal(t, exactName, result)
+		assert.Equal(t, MaxToolNameLength, len(result))
+	})
+
+	t.Run("long name gets truncated with sha1", func(t *testing.T) {
+		// Create a name longer than 64 characters
+		longName := "mcp__very_long_server_name__very_long_tool_name_that_exceeds_the_maximum_allowed_length"
+		require.Greater(t, len(longName), MaxToolNameLength)
+
+		result := truncateToolName(longName)
+
+		// Result should be exactly 64 characters
+		assert.Equal(t, MaxToolNameLength, len(result))
+
+		// Result should start with a truncated prefix
+		assert.True(t, len(result) > 0)
+
+		// Result should end with SHA1 hash (40 hex chars)
+		// SHA1 hash is 40 characters, so prefix should be 24 chars
+		expectedPrefixLen := MaxToolNameLength - 40
+		assert.Equal(t, longName[:expectedPrefixLen], result[:expectedPrefixLen])
+	})
+
+	t.Run("truncated names are unique", func(t *testing.T) {
+		// Two similar long names should produce different truncated results
+		longName1 := "mcp__server__very_long_tool_name_that_exceeds_maximum_length_version_1"
+		longName2 := "mcp__server__very_long_tool_name_that_exceeds_maximum_length_version_2"
+
+		result1 := truncateToolName(longName1)
+		result2 := truncateToolName(longName2)
+
+		assert.NotEqual(t, result1, result2, "Different long names should produce different truncated results")
+		assert.Equal(t, MaxToolNameLength, len(result1))
+		assert.Equal(t, MaxToolNameLength, len(result2))
+	})
+
+	t.Run("same long name produces consistent result", func(t *testing.T) {
+		longName := "mcp__server__very_long_tool_name_that_exceeds_the_maximum_allowed_length"
+
+		result1 := truncateToolName(longName)
+		result2 := truncateToolName(longName)
+
+		assert.Equal(t, result1, result2, "Same input should produce same truncated result")
+	})
+
+	t.Run("extremely long name", func(t *testing.T) {
+		// Test with a very long name (200+ chars)
+		extremelyLongName := "mcp__server_with_extremely_long_name__tool_with_extremely_long_name_" +
+			"that_goes_on_and_on_and_on_with_many_underscores_and_descriptive_text_" +
+			"that_makes_it_way_beyond_the_maximum_allowed_length_of_64_characters"
+		require.Greater(t, len(extremelyLongName), 200)
+
+		result := truncateToolName(extremelyLongName)
+
+		assert.Equal(t, MaxToolNameLength, len(result))
+		assert.NotEqual(t, extremelyLongName, result)
+	})
+}
+
+// TestGenerateToolSpecWithTruncation tests tool spec generation with name truncation
+func TestGenerateToolSpecWithTruncation(t *testing.T) {
+	t.Run("short server and tool names", func(t *testing.T) {
+		tool := MCPTool{
+			Name:        "weather",
+			Description: "Get weather",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		}
+
+		spec := generateToolSpec("api", tool)
+		expectedName := "mcp__api__weather"
+		assert.Equal(t, expectedName, spec.Name)
+		assert.LessOrEqual(t, len(spec.Name), MaxToolNameLength)
+	})
+
+	t.Run("long server and tool names get truncated", func(t *testing.T) {
+		tool := MCPTool{
+			Name:        "get_weather_forecast_for_location_with_extended_details",
+			Description: "Get detailed weather forecast",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		}
+
+		spec := generateToolSpec("weather_service_with_very_long_name", tool)
+
+		// Name should be truncated to 64 chars
+		assert.Equal(t, MaxToolNameLength, len(spec.Name))
+
+		// Should start with the MCP prefix
+		assert.True(t, len(spec.Name) > 0)
+
+		// Other fields should be unaffected
+		assert.Contains(t, spec.Description, "detailed weather forecast")
+		assert.NotNil(t, spec.ParametersSchema)
+	})
+
+	t.Run("edge case at boundary", func(t *testing.T) {
+		// Create server and tool name that results in exactly 64 chars
+		// Format: "mcp__<server>__<tool>"
+		// Length: 5 + len(server) + 2 + len(tool) = 64
+		// So: len(server) + len(tool) = 57
+		serverName := "server12345678901234"  // 20 chars
+		toolName := "tool123456789012345678901234567890123" // 37 chars
+		// Total: mcp__ (5) + 20 + __ (2) + 37 = 64
+
+		tool := MCPTool{
+			Name:        toolName,
+			Description: "Test tool",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		}
+
+		spec := generateToolSpec(serverName, tool)
+		expectedName := fmt.Sprintf("mcp__%s__%s", serverName, toolName)
+		require.Equal(t, 64, len(expectedName))
+
+		assert.Equal(t, expectedName, spec.Name)
+		assert.Equal(t, MaxToolNameLength, len(spec.Name))
+	})
+}
+
 // TestMCPSchema tests schema mapping
 func TestMCPSchema(t *testing.T) {
 	t.Run("convert MCP schema to runtime schema", func(t *testing.T) {
@@ -634,6 +778,161 @@ func TestConcurrentSafety(t *testing.T) {
 	})
 }
 
+// TestProcessCleanup tests that stdio client properly cleans up processes
+func TestProcessCleanup(t *testing.T) {
+	t.Run("process is properly reaped after close", func(t *testing.T) {
+		// Create a simple echo-based MCP server that will stay alive
+		cfg := config.MCPServerConfig{
+			Command: "cat", // cat will stay alive reading from stdin
+			Enabled: true,
+		}
+
+		client := newStdioClient(cfg)
+
+		// Start the process (skip protocol initialization since cat isn't a real MCP server)
+		cmd := exec.Command(cfg.Command)
+		stdin, err := cmd.StdinPipe()
+		require.NoError(t, err)
+		stdout, err := cmd.StdoutPipe()
+		require.NoError(t, err)
+		stderr, err := cmd.StderrPipe()
+		require.NoError(t, err)
+
+		err = cmd.Start()
+		require.NoError(t, err)
+
+		client.cmd = cmd
+		client.stdin = stdin
+		client.stdout = stdout
+		client.stderr = stderr
+
+		// Verify the process is running
+		assert.NotNil(t, cmd.Process)
+		originalPID := cmd.Process.Pid
+
+		// Close the client
+		err = client.close()
+		assert.NoError(t, err)
+
+		// Verify the process no longer exists
+		// On Unix systems, sending signal 0 checks if process exists
+		process, _ := os.FindProcess(originalPID)
+		if process != nil {
+			// Try to send signal 0 (does nothing but checks existence)
+			err := process.Signal(os.Signal(nil))
+			// On macOS/Linux, if process doesn't exist, we get an error
+			// This is platform-specific but validates the process was reaped
+			if err == nil {
+				// Process still exists - this is only expected on some systems
+				// where FindProcess always succeeds. We mainly care that Wait() was called.
+				t.Logf("Process %d may still exist (platform-specific), but Wait() was called", originalPID)
+			}
+		}
+
+		// Verify all resources are nil after close
+		assert.Nil(t, client.cmd)
+		assert.Nil(t, client.stdin)
+		assert.Nil(t, client.stdout)
+		assert.Nil(t, client.stderr)
+	})
+
+	t.Run("stderr consumption prevents deadlock", func(t *testing.T) {
+		// This test verifies that stderr is consumed to prevent deadlock
+		// when a child process writes a lot to stderr
+
+		cfg := config.MCPServerConfig{
+			// Use a command that writes to stderr
+			Command: "sh",
+			Args:    []string{"-c", "echo 'error message' >&2; sleep 0.1"},
+			Enabled: true,
+		}
+
+		client := newStdioClient(cfg)
+
+		cmd := exec.Command(cfg.Command, cfg.Args...)
+		stdin, err := cmd.StdinPipe()
+		require.NoError(t, err)
+		stdout, err := cmd.StdoutPipe()
+		require.NoError(t, err)
+		stderr, err := cmd.StderrPipe()
+		require.NoError(t, err)
+
+		err = cmd.Start()
+		require.NoError(t, err)
+
+		client.cmd = cmd
+		client.stdin = stdin
+		client.stdout = stdout
+		client.stderr = stderr
+		client.reader = bufio.NewReader(stdout)
+
+		// Start stderr consumer (simulating what initialize does)
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, err := stderr.Read(buf)
+				if n > 0 {
+					client.mu.Lock()
+					client.stderrBuf.Write(buf[:n])
+					client.mu.Unlock()
+				}
+				if err != nil {
+					break
+				}
+			}
+		}()
+
+		// Wait a bit for the command to write to stderr
+		time.Sleep(150 * time.Millisecond)
+
+		// Close should not deadlock
+		done := make(chan error, 1)
+		go func() {
+			done <- client.close()
+		}()
+
+		select {
+		case err := <-done:
+			assert.NoError(t, err)
+			// Verify stderr was captured
+			client.mu.Lock()
+			stderrContent := client.stderrBuf.String()
+			client.mu.Unlock()
+			assert.Contains(t, stderrContent, "error message")
+		case <-time.After(2 * time.Second):
+			t.Fatal("close() deadlocked or took too long")
+		}
+	})
+
+	t.Run("double close is safe", func(t *testing.T) {
+		cfg := config.MCPServerConfig{
+			Command: "cat",
+			Enabled: true,
+		}
+
+		client := newStdioClient(cfg)
+
+		cmd := exec.Command(cfg.Command)
+		stdin, _ := cmd.StdinPipe()
+		stdout, _ := cmd.StdoutPipe()
+		stderr, _ := cmd.StderrPipe()
+		cmd.Start()
+
+		client.cmd = cmd
+		client.stdin = stdin
+		client.stdout = stdout
+		client.stderr = stderr
+
+		// First close
+		err := client.close()
+		assert.NoError(t, err)
+
+		// Second close should not panic or error
+		err = client.close()
+		assert.NoError(t, err)
+	})
+}
+
 // TestErrorHandling tests various error scenarios
 func TestErrorHandling(t *testing.T) {
 	t.Run("server not found", func(t *testing.T) {
@@ -724,4 +1023,255 @@ func (m *mockMCPClient) close() error {
 
 func (m *mockMCPClient) transportType() string {
 	return m.transport
+}
+
+// TestServerNameValidation tests the server name validation logic
+func TestServerNameValidation(t *testing.T) {
+	t.Run("valid server names", func(t *testing.T) {
+		validNames := []string{
+			"weather",
+			"weather-api",
+			"weather_api",
+			"WeatherAPI",
+			"weather123",
+			"api-server-1",
+			"my_cool_server",
+			"Server123-test_name",
+			"a",
+			"A",
+			"1",
+			"_",
+			"-",
+		}
+
+		for _, name := range validNames {
+			t.Run(name, func(t *testing.T) {
+				assert.True(t, isValidMCPServerName(name), "Expected '%s' to be valid", name)
+				assert.NoError(t, validateMCPServerName(name), "Expected '%s' to be valid", name)
+			})
+		}
+	})
+
+	t.Run("invalid server names", func(t *testing.T) {
+		invalidNames := []string{
+			"",                  // empty
+			"my server",         // space
+			"api@service",       // @ symbol
+			"server.name",       // period
+			"server/name",       // slash
+			"server\\name",      // backslash
+			"server:name",       // colon
+			"server;name",       // semicolon
+			"server|name",       // pipe
+			"server*name",       // asterisk
+			"server?name",       // question mark
+			"server!name",       // exclamation
+			"server#name",       // hash
+			"server$name",       // dollar
+			"server%name",       // percent
+			"server^name",       // caret
+			"server&name",       // ampersand
+			"server(name",       // parenthesis
+			"server)name",       // parenthesis
+			"server[name",       // bracket
+			"server]name",       // bracket
+			"server{name",       // brace
+			"server}name",       // brace
+			"server<name",       // angle bracket
+			"server>name",       // angle bracket
+			"server=name",       // equals
+			"server+name",       // plus
+			"server~name",       // tilde
+			"server`name",       // backtick
+			"server'name",       // single quote
+			"server\"name",      // double quote
+			"server\nname",      // newline
+			"server\tname",      // tab
+			"server\rname",      // carriage return
+			"weather api",       // space (common mistake)
+			"api@weather",       // email-like (common mistake)
+			"my.server",         // domain-like (common mistake)
+			"server/path",       // path-like (common mistake)
+			"server:8080",       // port-like (common mistake)
+			"http://server",     // URL-like (common mistake)
+			"../server",         // path traversal attempt
+			"./server",          // relative path
+			"server/../other",   // path traversal attempt
+			"日本語",               // non-ASCII characters
+			"café",              // accented characters
+			"emoji😀",           // emoji
+		}
+
+		for _, name := range invalidNames {
+			t.Run(fmt.Sprintf("invalid_%s", name), func(t *testing.T) {
+				assert.False(t, isValidMCPServerName(name), "Expected '%s' to be invalid", name)
+				err := validateMCPServerName(name)
+				assert.Error(t, err, "Expected '%s' to be invalid", name)
+				if name == "" {
+					assert.Contains(t, err.Error(), "cannot be empty")
+				} else {
+					assert.Contains(t, err.Error(), "invalid")
+				}
+			})
+		}
+	})
+
+	t.Run("edge cases", func(t *testing.T) {
+		// Single character names
+		assert.True(t, isValidMCPServerName("a"))
+		assert.True(t, isValidMCPServerName("A"))
+		assert.True(t, isValidMCPServerName("1"))
+		assert.True(t, isValidMCPServerName("_"))
+		assert.True(t, isValidMCPServerName("-"))
+
+		// Very long valid name
+		longValidName := "a" + string(make([]byte, 100))
+		for i := range longValidName {
+			if i > 0 {
+				longValidName = longValidName[:i] + "a" + longValidName[i+1:]
+			}
+		}
+		assert.True(t, isValidMCPServerName(longValidName))
+
+		// Names that are almost valid
+		assert.False(t, isValidMCPServerName(" leading-space"))
+		assert.False(t, isValidMCPServerName("trailing-space "))
+		assert.False(t, isValidMCPServerName("mid dle-space"))
+	})
+}
+
+// TestMCPManager_ServerNameValidation tests that invalid server names are rejected
+func TestMCPManager_ServerNameValidation(t *testing.T) {
+	t.Run("reject invalid server names", func(t *testing.T) {
+		cfg := &config.Config{
+			MCPServers: map[string]config.MCPServerConfig{
+				"valid-server": {
+					Command: "valid-mcp",
+					Enabled: true,
+				},
+				"invalid server": { // space in name
+					Command: "invalid-mcp",
+					Enabled: true,
+				},
+				"valid_server2": {
+					Command: "valid-mcp2",
+					Enabled: true,
+				},
+				"api@service": { // @ symbol
+					Command: "api-mcp",
+					Enabled: true,
+				},
+			},
+		}
+
+		manager := NewMCPManager(cfg)
+		require.NotNil(t, manager)
+
+		// Should only have valid servers
+		assert.Len(t, manager.clients, 2)
+		assert.Contains(t, manager.clients, "valid-server")
+		assert.Contains(t, manager.clients, "valid_server2")
+		assert.NotContains(t, manager.clients, "invalid server")
+		assert.NotContains(t, manager.clients, "api@service")
+	})
+
+	t.Run("empty server name", func(t *testing.T) {
+		cfg := &config.Config{
+			MCPServers: map[string]config.MCPServerConfig{
+				"": { // empty name
+					Command: "empty-mcp",
+					Enabled: true,
+				},
+			},
+		}
+
+		manager := NewMCPManager(cfg)
+		require.NotNil(t, manager)
+
+		// Should reject empty name
+		assert.Len(t, manager.clients, 0)
+	})
+
+	t.Run("all valid names", func(t *testing.T) {
+		cfg := &config.Config{
+			MCPServers: map[string]config.MCPServerConfig{
+				"server1": {
+					Command: "server1-cmd",
+					Enabled: true,
+				},
+				"server-2": {
+					Command: "server2-cmd",
+					Enabled: true,
+				},
+				"server_3": {
+					Command: "server3-cmd",
+					Enabled: true,
+				},
+				"Server4": {
+					Command: "server4-cmd",
+					Enabled: true,
+				},
+			},
+		}
+
+		manager := NewMCPManager(cfg)
+		require.NotNil(t, manager)
+
+		// Should have all servers
+		assert.Len(t, manager.clients, 4)
+		assert.Contains(t, manager.clients, "server1")
+		assert.Contains(t, manager.clients, "server-2")
+		assert.Contains(t, manager.clients, "server_3")
+		assert.Contains(t, manager.clients, "Server4")
+	})
+
+	t.Run("security test - path traversal attempts", func(t *testing.T) {
+		cfg := &config.Config{
+			MCPServers: map[string]config.MCPServerConfig{
+				"../etc/passwd": { // path traversal
+					Command: "malicious-mcp",
+					Enabled: true,
+				},
+				"./local": { // relative path
+					Command: "malicious-mcp2",
+					Enabled: true,
+				},
+				"server/../other": { // embedded traversal
+					Command: "malicious-mcp3",
+					Enabled: true,
+				},
+			},
+		}
+
+		manager := NewMCPManager(cfg)
+		require.NotNil(t, manager)
+
+		// Should reject all malicious names
+		assert.Len(t, manager.clients, 0)
+	})
+
+	t.Run("security test - special characters", func(t *testing.T) {
+		cfg := &config.Config{
+			MCPServers: map[string]config.MCPServerConfig{
+				"server;rm -rf /": { // command injection attempt
+					Command: "malicious-mcp",
+					Enabled: true,
+				},
+				"server|cat /etc/passwd": { // pipe injection
+					Command: "malicious-mcp2",
+					Enabled: true,
+				},
+				"server$(whoami)": { // command substitution
+					Command: "malicious-mcp3",
+					Enabled: true,
+				},
+			},
+		}
+
+		manager := NewMCPManager(cfg)
+		require.NotNil(t, manager)
+
+		// Should reject all malicious names
+		assert.Len(t, manager.clients, 0)
+	})
 }
