@@ -70,6 +70,9 @@ type Result struct {
 
 	// Error is set if sandbox execution failed (not command failure)
 	Error error
+
+	// Violation is set if a sandbox policy violation was detected
+	Violation *Violation
 }
 
 // Commander is an interface for executing commands (used internally by sandboxes).

@@ -109,6 +109,13 @@ func (n *NativeSandbox) Execute(ctx context.Context, cmd *sandbox.Command) (*san
 			// Command ran but returned non-zero exit code
 			result.ExitCode = exitErr.ExitCode()
 			result.Error = nil // Non-zero exit is not an error in our model
+
+			// Check for sandbox violations
+			detector := sandbox.NewViolationDetector(n.Type())
+			if violation := detector.DetectViolation(result); violation != nil {
+				result.Violation = violation
+			}
+
 			return result, nil
 		}
 

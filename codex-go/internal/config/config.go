@@ -10,6 +10,7 @@ import (
 	"runtime"
 
 	"github.com/BurntSushi/toml"
+	"github.com/evmts/codex/codex-go/internal/models"
 )
 
 // Config represents the application configuration loaded from disk and merged with overrides.
@@ -62,6 +63,15 @@ type Config struct {
 	// MCPServers defines MCP servers that Codex can reach out to for tool calls
 	MCPServers map[string]MCPServerConfig
 
+	// Notify contains notification configurations for various events
+	Notify NotifyConfig
+
+	// WebSearchProvider specifies the web search provider to use (e.g., "duckduckgo")
+	WebSearchProvider string
+
+	// WebSearchEnabled controls whether web search functionality is available
+	WebSearchEnabled bool
+
 	// APIKey is the API key for the model provider (from env vars or auth.json)
 	APIKey string
 
@@ -112,6 +122,63 @@ type MCPServerConfig struct {
 
 	// DisabledTools is an explicit deny-list of tools from this server
 	DisabledTools []string `toml:"disabled_tools"`
+
+	// OAuth contains OAuth 2.0 configuration for authenticated servers
+	OAuth *MCPOAuthConfig `toml:"oauth"`
+}
+
+// MCPOAuthConfig defines OAuth 2.0 configuration for an MCP server
+type MCPOAuthConfig struct {
+	// ClientID is the OAuth 2.0 client identifier
+	ClientID string `toml:"client_id"`
+
+	// ClientSecret is the OAuth 2.0 client secret (optional for public clients)
+	ClientSecret string `toml:"client_secret"`
+
+	// AuthURL is the authorization endpoint (optional if using discovery)
+	AuthURL string `toml:"auth_url"`
+
+	// TokenURL is the token endpoint (optional if using discovery)
+	TokenURL string `toml:"token_url"`
+
+	// Scopes are the requested OAuth scopes
+	Scopes []string `toml:"scopes"`
+
+	// UseDiscovery enables automatic OAuth endpoint discovery
+	UseDiscovery bool `toml:"use_discovery"`
+
+	// UsePKCE enables PKCE (Proof Key for Code Exchange)
+	UsePKCE bool `toml:"use_pkce"`
+}
+
+// NotifyConfig contains notification configurations.
+type NotifyConfig struct {
+	// OnTurnComplete is triggered when a turn completes successfully
+	OnTurnComplete *NotifyTriggerConfig `toml:"on_turn_complete"`
+
+	// OnError is triggered when a turn encounters an error
+	OnError *NotifyTriggerConfig `toml:"on_error"`
+
+	// OnApprovalNeeded is triggered when user approval is required
+	OnApprovalNeeded *NotifyTriggerConfig `toml:"on_approval_needed"`
+
+	// OnTurnAborted is triggered when a turn is aborted
+	OnTurnAborted *NotifyTriggerConfig `toml:"on_turn_aborted"`
+
+	// ScriptTimeoutSec is the maximum time scripts can run in seconds
+	ScriptTimeoutSec *float64 `toml:"script_timeout_sec"`
+}
+
+// NotifyTriggerConfig defines configuration for a notification trigger.
+type NotifyTriggerConfig struct {
+	// Command is the script command to execute
+	Command string `toml:"command"`
+
+	// Enabled controls whether this notification is active
+	Enabled bool `toml:"enabled"`
+
+	// Env contains additional environment variables for the script
+	Env map[string]string `toml:"env"`
 }
 
 // configTOML represents the raw configuration structure from TOML file
@@ -131,6 +198,9 @@ type configTOML struct {
 	ProjectDocFallbackFilenames []string                   `toml:"project_doc_fallback_filenames"`
 	DisablePasteBurst           *bool                      `toml:"disable_paste_burst"`
 	MCPServers                  map[string]MCPServerConfig `toml:"mcp_servers"`
+	Notify                      *NotifyConfig              `toml:"notify"`
+	WebSearchProvider           *string                    `toml:"web_search_provider"`
+	WebSearchEnabled            *bool                      `toml:"web_search_enabled"`
 	Profile                     *string                    `toml:"profile"`
 }
 
@@ -154,6 +224,8 @@ func LoadConfig() (*Config, error) {
 		ProjectDocMaxBytes:          32 * 1024, // 32 KiB
 		ProjectDocFallbackFilenames: []string{},
 		MCPServers:                  make(map[string]MCPServerConfig),
+		WebSearchProvider:           "duckduckgo",
+		WebSearchEnabled:            false, // Disabled by default
 	}
 
 	// Load from TOML file if it exists
@@ -234,8 +306,17 @@ func loadTOMLConfig(path string, cfg *Config) error {
 			cfg.MCPServers[name] = server
 		}
 	}
+	if tomlCfg.Notify != nil {
+		cfg.Notify = *tomlCfg.Notify
+	}
 	if tomlCfg.Profile != nil {
 		cfg.Profile = *tomlCfg.Profile
+	}
+	if tomlCfg.WebSearchProvider != nil {
+		cfg.WebSearchProvider = *tomlCfg.WebSearchProvider
+	}
+	if tomlCfg.WebSearchEnabled != nil {
+		cfg.WebSearchEnabled = *tomlCfg.WebSearchEnabled
 	}
 
 	return nil
@@ -307,27 +388,37 @@ func getDefaultModel() string {
 // Validate checks that the configuration is valid and returns an error if not.
 func (c *Config) Validate() error {
 	if c.Model == "" {
-		return fmt.Errorf("model cannot be empty")
+		return fmt.Errorf("configuration error: 'model' cannot be empty. Set CODEX_MODEL environment variable or add 'model' to config.toml")
+	}
+
+	// Validate model exists in registry
+	if err := models.ValidateModel(c.Model); err != nil {
+		return fmt.Errorf("configuration error: invalid model '%s': %w. Run 'codex models list' to see available models", c.Model, err)
 	}
 
 	if c.ReviewModel == "" {
-		return fmt.Errorf("review_model cannot be empty")
+		return fmt.Errorf("configuration error: 'review_model' cannot be empty. Add 'review_model' to config.toml")
+	}
+
+	// Validate review model exists in registry
+	if err := models.ValidateModel(c.ReviewModel); err != nil {
+		return fmt.Errorf("configuration error: invalid review_model '%s': %w. Run 'codex models list' to see available models", c.ReviewModel, err)
 	}
 
 	if c.ModelProvider == "" {
-		return fmt.Errorf("model_provider cannot be empty")
+		return fmt.Errorf("configuration error: 'model_provider' cannot be empty. Add 'model_provider' to config.toml (e.g., 'openai-responses')")
 	}
 
 	if c.CodexHome == "" {
-		return fmt.Errorf("codex_home cannot be empty")
+		return fmt.Errorf("configuration error: 'codex_home' cannot be empty. Set CODEX_HOME environment variable or let it default to ~/.codex")
 	}
 
 	if c.ChatGPTBaseURL == "" {
-		return fmt.Errorf("chatgpt_base_url cannot be empty")
+		return fmt.Errorf("configuration error: 'chatgpt_base_url' cannot be empty. Set CODEX_BASE_URL or add 'chatgpt_base_url' to config.toml")
 	}
 
 	if c.ProjectDocMaxBytes <= 0 {
-		return fmt.Errorf("project_doc_max_bytes must be positive")
+		return fmt.Errorf("configuration error: 'project_doc_max_bytes' must be positive (got: %d). Set a value like 32768 (32 KiB)", c.ProjectDocMaxBytes)
 	}
 
 	// Validate approval policy if set
@@ -338,7 +429,7 @@ func (c *Config) Validate() error {
 			"never":  true,
 		}
 		if !validPolicies[c.ApprovalPolicy] {
-			return fmt.Errorf("invalid approval_policy: %s (must be auto, always, or never)", c.ApprovalPolicy)
+			return fmt.Errorf("configuration error: invalid approval_policy '%s'. Must be one of: 'auto', 'always', or 'never'", c.ApprovalPolicy)
 		}
 	}
 
