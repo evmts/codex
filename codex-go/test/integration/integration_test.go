@@ -412,21 +412,17 @@ func TestFullSessionWithPersistence(t *testing.T) {
 
         mgr2, err := manager.NewManager(manager.ManagerConfig{Client: mkClientFor("Turn2", usage2), HistoryFs: fs, SessionsRoot: "/sessions", EnableHistory: true})
         require.NoError(t, err)
-        defer mgr2.Close()
 
         // Resume session
         resumed, err := mgr2.ResumeSession(ctx, "persist-1")
         require.NoError(t, err)
         require.NotNil(t, resumed)
 
-        // Hook handler again
-        done2 := make(chan struct{}, 1)
-        _, _ = resumed, done2
-
         // Submit second turn via new manager
         require.NoError(t, mgr2.SubmitOp(ctx, "persist-1", op))
-        // Wait for completion
-        time.Sleep(100 * time.Millisecond)
+
+        // Close mgr2 to ensure all background work completes (this waits for turn processing to finish)
+        require.NoError(t, mgr2.Close())
 
         // Verify history file exists
         exists, err := afero.Exists(fs, persistence.GetSessionHistoryPath("/sessions", "persist-1"))
