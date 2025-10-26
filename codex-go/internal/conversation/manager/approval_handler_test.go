@@ -172,3 +172,77 @@ func TestSessionApprovalHandler_ConcurrentRequestsError(t *testing.T) {
     assert.Contains(t, err.Error(), "already pending")
 }
 
+func TestSessionApprovalHandler_ApprovalTimeout(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    mockClient := mocks.NewMockClient(ctrl)
+    sess := createTestSession(t, mockClient)
+
+    // Set a short approval timeout for testing (100ms)
+    op := &protocol.OpUserTurn{
+        Items:          []protocol.UserInput{{Type: "text", Text: strPtr("hi")}},
+        Cwd:            ".",
+        ApprovalPolicy: "manual",
+        SandboxPolicy:  protocol.SandboxPolicy{Mode: "workspace-write"},
+        Model:          "gpt-4",
+    }
+    submissionID, err := sess.SubmitTurn(context.Background(), op)
+    require.NoError(t, err)
+
+    // Update turn context with short timeout
+    sess.turnContext.ApprovalTimeout = 100 * time.Millisecond
+
+    sah := NewSessionApprovalHandler(sess, submissionID)
+
+    // Run HandleApproval - it should timeout without user response
+    req := &runtime.ApprovalRequest{CallID: "call-timeout", ToolName: "shell", Command: []string{"sh", "-c", "rm -rf /"}}
+    startTime := time.Now()
+    decision, err := sah.HandleApproval(context.Background(), req)
+    elapsed := time.Since(startTime)
+
+    // Should have timed out
+    require.Error(t, err)
+    assert.Contains(t, err.Error(), "timed out")
+    assert.Equal(t, runtime.ApprovalDenied, decision)
+
+    // Should have taken approximately the timeout duration (allow some variance)
+    assert.Greater(t, elapsed, 80*time.Millisecond, "timeout should be at least 80ms")
+    assert.Less(t, elapsed, 200*time.Millisecond, "timeout should be less than 200ms")
+}
+
+func TestSessionApprovalHandler_DefaultApprovalTimeout(t *testing.T) {
+    ctrl := gomock.NewController(t)
+    defer ctrl.Finish()
+
+    mockClient := mocks.NewMockClient(ctrl)
+    sess := createTestSession(t, mockClient)
+
+    // Use default timeout (0 = 5 minutes) but we'll cancel before that
+    op := &protocol.OpUserTurn{
+        Items:          []protocol.UserInput{{Type: "text", Text: strPtr("hi")}},
+        Cwd:            ".",
+        ApprovalPolicy: "manual",
+        SandboxPolicy:  protocol.SandboxPolicy{Mode: "workspace-write"},
+        Model:          "gpt-4",
+    }
+    submissionID, err := sess.SubmitTurn(context.Background(), op)
+    require.NoError(t, err)
+
+    // Leave ApprovalTimeout as 0 (should default to 5 minutes)
+    sess.turnContext.ApprovalTimeout = 0
+
+    sah := NewSessionApprovalHandler(sess, submissionID)
+
+    // Run HandleApproval with a parent context that times out quickly
+    ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+    defer cancel()
+
+    req := &runtime.ApprovalRequest{CallID: "call-default", ToolName: "shell"}
+    _, err = sah.HandleApproval(ctx, req)
+
+    // Should have been cancelled by parent context, not the 5-minute default
+    require.Error(t, err)
+    assert.Contains(t, err.Error(), "context deadline exceeded")
+}
+

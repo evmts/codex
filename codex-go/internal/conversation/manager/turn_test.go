@@ -119,3 +119,73 @@ func TestTurnProcessor_TokenUsageAccumulation(t *testing.T) {
     assert.Equal(t, int64(7), tu.OutputTokens)
     assert.Equal(t, int64(18), tu.TotalTokens)
 }
+
+func TestTurnProcessor_ConfigurableMaxTurnLimit(t *testing.T) {
+    // Orchestrator with mock tool
+    reg := runtime.NewToolRegistry()
+    reg.Register(&mockToolOK{})
+    orch := orchestrator.NewOrchestrator(reg, runtime.NewMemoryApprovalCache(), func(ctx context.Context, req *runtime.ApprovalRequest) (runtime.ApprovalDecision, error) {
+        return runtime.ApprovalApprovedForSession, nil
+    })
+
+    tests := []struct {
+        name      string
+        maxTurns  int
+        wantError bool
+        errorMsg  string
+    }{
+        {
+            name:      "custom limit of 3",
+            maxTurns:  3,
+            wantError: true,
+            errorMsg:  "maximum multi-turn iterations exceeded: 3",
+        },
+        {
+            name:      "custom limit of 5",
+            maxTurns:  5,
+            wantError: true,
+            errorMsg:  "maximum multi-turn iterations exceeded: 5",
+        },
+        {
+            name:      "zero uses default of 10",
+            maxTurns:  0,
+            wantError: true,
+            errorMsg:  "maximum multi-turn iterations exceeded: 10",
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            // Session with custom max turns
+            sess, err := NewSession(SessionConfig{
+                ID:     "s-config-" + tt.name,
+                Client: &mockClientAlwaysToolCall{},
+                TurnContext: &TurnContext{
+                    Cwd:            ".",
+                    ApprovalPolicy: "auto",
+                    SandboxPolicy:  protocol.SandboxPolicy{Mode: "workspace-write"},
+                    Model:          "gpt-4",
+                    MaxTurns:       tt.maxTurns,
+                },
+                Orchestrator: orch,
+            })
+            require.NoError(t, err)
+
+            ctx := context.Background()
+            text := "go"
+            op := &protocol.OpUserTurn{Items: []protocol.UserInput{{Type: "text", Text: &text}}, Cwd: ".", ApprovalPolicy: "auto", SandboxPolicy: protocol.SandboxPolicy{Mode: "workspace-write"}, Model: "gpt-4"}
+            submissionID, err := sess.SubmitTurn(ctx, op)
+            require.NoError(t, err)
+
+            tp := NewTurnProcessor(sess)
+            err = tp.ProcessTurn(ctx, submissionID, op)
+
+            if tt.wantError {
+                require.Error(t, err)
+                assert.Contains(t, err.Error(), tt.errorMsg)
+            } else {
+                require.NoError(t, err)
+            }
+        })
+    }
+}
