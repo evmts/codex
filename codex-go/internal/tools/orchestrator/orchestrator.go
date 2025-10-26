@@ -227,3 +227,13 @@ func (o *Orchestrator) getApprovalPolicyFromSandboxPolicy(sandboxPolicy runtime.
 		return runtime.ApprovalOnRequest
 	}
 }
+
+// GetRegistry returns the tool registry (for creating new orchestrators with different handlers).
+func (o *Orchestrator) GetRegistry() *runtime.ToolRegistry {
+	return o.registry
+}
+
+// GetApprovalCache returns the approval cache (for creating new orchestrators with different handlers).
+func (o *Orchestrator) GetApprovalCache() runtime.ApprovalCache {
+	return o.approvalCache
+}

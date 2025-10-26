@@ -8,6 +8,7 @@ import (
 
     "github.com/evmts/codex/codex-go/internal/client"
     "github.com/evmts/codex/codex-go/internal/protocol"
+    "github.com/evmts/codex/codex-go/internal/tools/orchestrator"
     "github.com/evmts/codex/codex-go/internal/tools/runtime"
 )
 
@@ -35,7 +36,6 @@ func NewTurnProcessorWithApprovalHandler(session *Session, submissionID string) 
 	approvalHandler := NewSessionApprovalHandler(session, submissionID)
 	// Register approval handler with session
 	session.SetApprovalHandler(approvalHandler)
-	defer session.ClearApprovalHandler()
 
 	return &TurnProcessor{
 		session:         session,
@@ -516,8 +516,24 @@ func (tp *TurnProcessor) executeToolCalls(ctx context.Context, submissionID stri
             StartTime:      time.Now(),
         }
 
-        // Execute
-        result, err := tp.session.Orchestrator().Execute(ctx, req, execCtx)
+        // Execute with approval handler if available
+        var result *runtime.ExecutionResult
+        var err error
+        
+        if tp.approvalHandler != nil && tp.session.Orchestrator() != nil {
+            // Create orchestrator with our approval handler for this turn
+            baseOrch := tp.session.Orchestrator()
+            tempOrch := orchestrator.NewOrchestrator(
+                baseOrch.GetRegistry(),
+                baseOrch.GetApprovalCache(),
+                tp.approvalHandler.CreateApprovalHandlerFunc(),
+            )
+            result, err = tempOrch.Execute(ctx, req, execCtx)
+        } else if tp.session.Orchestrator() != nil {
+            result, err = tp.session.Orchestrator().Execute(ctx, req, execCtx)
+        } else {
+            err = fmt.Errorf("no orchestrator configured")
+        }
         // Close writer (signals completion)
         _ = writer.Close()
 
@@ -564,8 +580,6 @@ func (tp *TurnProcessor) executeToolCalls(ctx context.Context, submissionID stri
 }
 
 // parseShellCommandFromArgs extracts the "command" field from a JSON string.
-// getOrchestratorWithApprovalHandler returns an orchestrator configured with the approval handler.
-// If no orchestrator is configured on the session, returns nil.
 func (tp *TurnProcessor) getOrchestratorWithApprovalHandler() *orchestrator.Orchestrator {
 	baseOrch := tp.session.Orchestrator()
 	if baseOrch == nil {
@@ -576,8 +590,8 @@ func (tp *TurnProcessor) getOrchestratorWithApprovalHandler() *orchestrator.Orch
 	if tp.approvalHandler != nil {
 		// Create new orchestrator with approval handler
 		return orchestrator.NewOrchestrator(
-			baseOrch.Registry(),
-			baseOrch.ApprovalCache(),
+			baseOrch.GetRegistry(),
+			baseOrch.GetApprovalCache(),
 			tp.approvalHandler.CreateApprovalHandlerFunc(),
 		)
 	}

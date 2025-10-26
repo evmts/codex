@@ -236,10 +236,16 @@ func (m *manager) handleUserTurn(ctx context.Context, session *Session, op *prot
 		turnCtx := session.Context()
 
 		processor := NewTurnProcessorWithApprovalHandler(session, submissionID)
-		if err := processor.ProcessTurn(turnCtx, submissionID, op); err != nil {
+
+		// Ensure cleanup happens regardless of outcome
+		defer func() {
 			if processor.approvalHandler != nil {
 				processor.approvalHandler.CancelAllPending()
 			}
+			session.ClearApprovalHandler()
+		}()
+
+		if err := processor.ProcessTurn(turnCtx, submissionID, op); err != nil {
 			// Mark turn as failed
 			_ = session.FailTurn(err.Error()) // nolint:errcheck
 
