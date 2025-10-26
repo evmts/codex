@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -53,8 +54,13 @@ func (t *ReadTool) Execute(ctx context.Context, req *runtime.ToolRequest, execCt
 		return nil, runtime.NewToolError(runtime.ErrorInvalidArguments, "path is required")
 	}
 
-	// Validate path
-	fullPath, err := validatePath(req.WorkingDirectory, args.Path)
+	// Validate path for read access
+	if err := ValidatePathForRead(args.Path, req.WorkingDirectory); err != nil {
+		return nil, runtime.NewToolErrorWithCause(runtime.ErrorInvalidArguments, err.Error(), err)
+	}
+
+	// Resolve path to absolute
+	fullPath, err := ResolvePath(args.Path, req.WorkingDirectory)
 	if err != nil {
 		return nil, runtime.NewToolErrorWithCause(runtime.ErrorInvalidArguments, err.Error(), err)
 	}
@@ -64,7 +70,7 @@ func (t *ReadTool) Execute(ctx context.Context, req *runtime.ToolRequest, execCt
 	if err != nil {
 		success := false
 		return &runtime.ToolResponse{
-			Content:       fmt.Sprintf("Error checking file: %v", err),
+			Content:       fmt.Sprintf("Error checking file '%s': %v. Verify the path is accessible", args.Path, err),
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),
 		}, nil
@@ -73,7 +79,7 @@ func (t *ReadTool) Execute(ctx context.Context, req *runtime.ToolRequest, execCt
 	if !exists {
 		success := false
 		return &runtime.ToolResponse{
-			Content:       fmt.Sprintf("File not found: %s", args.Path),
+			Content:       fmt.Sprintf("File not found: '%s'. Verify the path exists and is spelled correctly", args.Path),
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),
 		}, nil
@@ -83,8 +89,12 @@ func (t *ReadTool) Execute(ctx context.Context, req *runtime.ToolRequest, execCt
 	info, err := t.fs.Stat(fullPath)
 	if err != nil {
 		success := false
+		msg := fmt.Sprintf("Failed to read file '%s': %v", args.Path, err)
+		if os.IsPermission(err) {
+			msg += ". Check file permissions or try running with appropriate privileges"
+		}
 		return &runtime.ToolResponse{
-			Content:       fmt.Sprintf("Error reading file info: %v", err),
+			Content:       msg,
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),
 		}, nil
@@ -93,7 +103,7 @@ func (t *ReadTool) Execute(ctx context.Context, req *runtime.ToolRequest, execCt
 	if info.IsDir() {
 		success := false
 		return &runtime.ToolResponse{
-			Content:       fmt.Sprintf("Path is a directory: %s", args.Path),
+			Content:       fmt.Sprintf("Cannot read '%s': path is a directory, not a file. Provide a file path instead", args.Path),
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),
 		}, nil
@@ -103,8 +113,12 @@ func (t *ReadTool) Execute(ctx context.Context, req *runtime.ToolRequest, execCt
 	data, err := afero.ReadFile(t.fs, fullPath)
 	if err != nil {
 		success := false
+		msg := fmt.Sprintf("Failed to read file '%s': %v", args.Path, err)
+		if os.IsPermission(err) {
+			msg += ". Check file permissions or try running with appropriate privileges"
+		}
 		return &runtime.ToolResponse{
-			Content:       fmt.Sprintf("Error reading file: %v", err),
+			Content:       msg,
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),
 		}, nil
@@ -114,7 +128,7 @@ func (t *ReadTool) Execute(ctx context.Context, req *runtime.ToolRequest, execCt
 	if isBinaryFile(data) {
 		success := false
 		return &runtime.ToolResponse{
-			Content: fmt.Sprintf("File appears to be binary (%s, %s). Binary files cannot be read as text.",
+			Content: fmt.Sprintf("Cannot read '%s': file appears to be binary (%s). Use a binary file reader or convert to text format",
 				args.Path, formatFileSize(info.Size())),
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -54,8 +55,13 @@ func (t *WriteTool) Execute(ctx context.Context, req *runtime.ToolRequest, execC
 		return nil, runtime.NewToolError(runtime.ErrorInvalidArguments, "path is required")
 	}
 
-	// Validate path
-	fullPath, err := validatePath(req.WorkingDirectory, args.Path)
+	// Validate path for write access (includes sensitive path checks)
+	if err := ValidatePathForWrite(args.Path, req.WorkingDirectory); err != nil {
+		return nil, runtime.NewToolErrorWithCause(runtime.ErrorInvalidArguments, err.Error(), err)
+	}
+
+	// Resolve path to absolute
+	fullPath, err := ResolvePath(args.Path, req.WorkingDirectory)
 	if err != nil {
 		return nil, runtime.NewToolErrorWithCause(runtime.ErrorInvalidArguments, err.Error(), err)
 	}
@@ -64,7 +70,7 @@ func (t *WriteTool) Execute(ctx context.Context, req *runtime.ToolRequest, execC
 	if info, err := t.fs.Stat(fullPath); err == nil && info.IsDir() {
 		success := false
 		return &runtime.ToolResponse{
-			Content:       fmt.Sprintf("Path is a directory: %s", args.Path),
+			Content:       fmt.Sprintf("Cannot write to '%s': path is a directory, not a file. Provide a file path instead", args.Path),
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),
 		}, nil
@@ -74,8 +80,12 @@ func (t *WriteTool) Execute(ctx context.Context, req *runtime.ToolRequest, execC
 	dir := filepath.Dir(fullPath)
 	if err := t.fs.MkdirAll(dir, 0755); err != nil {
 		success := false
+		msg := fmt.Sprintf("Failed to create parent directories for '%s': %v", args.Path, err)
+		if os.IsPermission(err) {
+			msg += ". Check directory permissions or try running with appropriate privileges"
+		}
 		return &runtime.ToolResponse{
-			Content:       fmt.Sprintf("Error creating directories: %v", err),
+			Content:       msg,
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),
 		}, nil
@@ -84,8 +94,12 @@ func (t *WriteTool) Execute(ctx context.Context, req *runtime.ToolRequest, execC
 	// Perform atomic write using temp file + rename
 	if err := t.atomicWrite(fullPath, []byte(args.Content)); err != nil {
 		success := false
+		msg := fmt.Sprintf("Failed to write file '%s': %v", args.Path, err)
+		if os.IsPermission(err) {
+			msg += ". Check file permissions or try running with appropriate privileges"
+		}
 		return &runtime.ToolResponse{
-			Content:       fmt.Sprintf("Error writing file: %v", err),
+			Content:       msg,
 			Success:       &success,
 			ExecutionTime: time.Since(startTime),
 		}, nil
