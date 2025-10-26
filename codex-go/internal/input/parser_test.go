@@ -111,8 +111,13 @@ func TestParseFileReferences(t *testing.T) {
 					if i >= len(tt.wantRefPaths) {
 						break
 					}
-					if ref.Path != tt.wantRefPaths[i] {
-						t.Errorf("FileReference[%d].Path = %q, want %q", i, ref.Path, tt.wantRefPaths[i])
+					// Resolve expected path symlinks for comparison (e.g., /var -> /private/var on macOS)
+					expectedPath := tt.wantRefPaths[i]
+					if resolved, err := filepath.EvalSymlinks(expectedPath); err == nil {
+						expectedPath = resolved
+					}
+					if ref.Path != expectedPath {
+						t.Errorf("FileReference[%d].Path = %q, want %q", i, ref.Path, expectedPath)
 					}
 				}
 			}
@@ -249,8 +254,13 @@ func TestResolvePath(t *testing.T) {
 				return
 			}
 
-			if absPath != tt.wantAbsPath {
-				t.Errorf("absPath = %q, want %q", absPath, tt.wantAbsPath)
+			// Resolve expected path symlinks for comparison (e.g., /var -> /private/var on macOS)
+			expectedAbsPath := tt.wantAbsPath
+			if resolved, err := filepath.EvalSymlinks(tt.wantAbsPath); err == nil {
+				expectedAbsPath = resolved
+			}
+			if absPath != expectedAbsPath {
+				t.Errorf("absPath = %q, want %q", absPath, expectedAbsPath)
 			}
 			if display != tt.wantDisplay {
 				t.Errorf("display = %q, want %q", display, tt.wantDisplay)

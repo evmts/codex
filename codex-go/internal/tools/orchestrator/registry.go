@@ -1,11 +1,151 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/evmts/codex/codex-go/internal/tools/runtime"
 )
+
+const (
+	MaxCallIDLength      = 256
+	MaxToolNameLength    = 128
+	MaxArgumentsSize     = 1 * 1024 * 1024 // 1MB serialized
+	MaxArgumentDepth     = 10
+	MaxArraySize         = 1000
+	MaxStringSize        = 1 * 1024 * 1024 // 1MB per string
+	MaxRequestsPerBatch  = 100
+)
+
+// SanitizeCallID validates and sanitizes a call ID
+func SanitizeCallID(callID string) error {
+	if callID == "" {
+		return fmt.Errorf("call ID cannot be empty")
+	}
+
+	if len(callID) > MaxCallIDLength {
+		return fmt.Errorf("call ID exceeds maximum length of %d", MaxCallIDLength)
+	}
+
+	// Check for null bytes first
+	if strings.Contains(callID, "\x00") {
+		return fmt.Errorf("call ID contains null byte")
+	}
+
+	// Allow only alphanumeric, hyphen, and underscore
+	for i, c := range callID {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return fmt.Errorf("call ID contains invalid character at position %d: %c", i, c)
+		}
+	}
+
+	return nil
+}
+
+// SanitizeToolName validates and sanitizes a tool name
+func SanitizeToolName(toolName string) error {
+	if toolName == "" {
+		return fmt.Errorf("tool name cannot be empty")
+	}
+
+	if len(toolName) > MaxToolNameLength {
+		return fmt.Errorf("tool name exceeds maximum length of %d", MaxToolNameLength)
+	}
+
+	// Check for null bytes first
+	if strings.Contains(toolName, "\x00") {
+		return fmt.Errorf("tool name contains null byte")
+	}
+
+	// Prevent path traversal
+	if strings.Contains(toolName, "..") {
+		return fmt.Errorf("tool name contains path traversal")
+	}
+
+	// Allow only alphanumeric, hyphen, underscore, and slash (for namespaced tools)
+	for i, c := range toolName {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '/' || c == '.') {
+			return fmt.Errorf("tool name contains invalid character at position %d: %c", i, c)
+		}
+	}
+
+	return nil
+}
+
+// ValidateArgumentStructure validates the structure of tool arguments
+func ValidateArgumentStructure(args map[string]interface{}) error {
+	return validateValue(args, 0)
+}
+
+// validateValue recursively validates argument values
+func validateValue(val interface{}, depth int) error {
+	// Check depth to prevent stack overflow
+	if depth > MaxArgumentDepth {
+		return fmt.Errorf("argument nesting exceeds maximum depth of %d", MaxArgumentDepth)
+	}
+
+	switch v := val.(type) {
+	case nil:
+		// Nil is okay
+		return nil
+
+	case bool, int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64:
+		// Primitive types are okay
+		return nil
+
+	case string:
+		if len(v) > MaxStringSize {
+			return fmt.Errorf("string exceeds maximum size of %d bytes", MaxStringSize)
+		}
+		// Check for null bytes
+		if strings.Contains(v, "\x00") {
+			return fmt.Errorf("string contains null byte")
+		}
+		return nil
+
+	case []interface{}:
+		if len(v) > MaxArraySize {
+			return fmt.Errorf("array exceeds maximum size of %d elements", MaxArraySize)
+		}
+		for i, item := range v {
+			if err := validateValue(item, depth+1); err != nil {
+				return fmt.Errorf("array[%d]: %w", i, err)
+			}
+		}
+		return nil
+
+	case map[string]interface{}:
+		if len(v) > MaxArraySize {
+			return fmt.Errorf("object exceeds maximum size of %d properties", MaxArraySize)
+		}
+		for key, item := range v {
+			// Validate key
+			if key == "" {
+				return fmt.Errorf("object key cannot be empty")
+			}
+			if len(key) > 256 {
+				return fmt.Errorf("object key exceeds maximum length of 256")
+			}
+			if strings.Contains(key, "\x00") {
+				return fmt.Errorf("object key contains null byte")
+			}
+			// Validate value
+			if err := validateValue(item, depth+1); err != nil {
+				return fmt.Errorf("object[%s]: %w", key, err)
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported argument type: %T", v)
+	}
+}
 
 // RegistryHelper provides convenience methods for working with tool registries.
 // The core ToolRegistry is defined in runtime package; this adds orchestrator-specific helpers.
@@ -127,9 +267,23 @@ func (h *RegistryHelper) GetAllToolInfo() []*ToolInfo {
 // ValidateToolRequests validates a batch of tool requests.
 // Returns the first invalid request or nil if all are valid.
 func (h *RegistryHelper) ValidateToolRequests(requests []*runtime.ToolRequest) error {
-	for _, req := range requests {
+	if len(requests) == 0 {
+		return &runtime.ToolError{
+			Kind:    runtime.ErrorInvalidArguments,
+			Message: "requests cannot be empty",
+		}
+	}
+
+	if len(requests) > MaxRequestsPerBatch {
+		return &runtime.ToolError{
+			Kind:    runtime.ErrorInvalidArguments,
+			Message: fmt.Sprintf("batch exceeds maximum of %d requests", MaxRequestsPerBatch),
+		}
+	}
+
+	for i, req := range requests {
 		if err := h.ValidateToolRequest(req); err != nil {
-			return err
+			return fmt.Errorf("request[%d]: %w", i, err)
 		}
 	}
 	return nil
@@ -144,24 +298,55 @@ func (h *RegistryHelper) ValidateToolRequest(req *runtime.ToolRequest) error {
 		}
 	}
 
-	if req.CallID == "" {
+	// Validate CallID
+	if err := SanitizeCallID(req.CallID); err != nil {
 		return &runtime.ToolError{
 			Kind:    runtime.ErrorInvalidArguments,
-			Message: "request missing CallID",
+			Message: fmt.Sprintf("invalid CallID: %v", err),
 		}
 	}
 
-	if req.ToolName == "" {
+	// Validate ToolName
+	if err := SanitizeToolName(req.ToolName); err != nil {
 		return &runtime.ToolError{
 			Kind:    runtime.ErrorInvalidArguments,
-			Message: "request missing ToolName",
+			Message: fmt.Sprintf("invalid ToolName: %v", err),
 		}
 	}
 
+	// Check if tool exists
 	if !h.HasTool(req.ToolName) {
 		return &runtime.ToolError{
 			Kind:    runtime.ErrorInternal,
 			Message: fmt.Sprintf("tool not found: %s", req.ToolName),
+		}
+	}
+
+	// Validate arguments if present
+	if req.Arguments != "" {
+		// Check serialized size first
+		if len(req.Arguments) > MaxArgumentsSize {
+			return &runtime.ToolError{
+				Kind:    runtime.ErrorInvalidArguments,
+				Message: fmt.Sprintf("arguments exceed maximum size of %d bytes", MaxArgumentsSize),
+			}
+		}
+
+		// Validate JSON format
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(req.Arguments), &args); err != nil {
+			return &runtime.ToolError{
+				Kind:    runtime.ErrorInvalidArguments,
+				Message: fmt.Sprintf("arguments are not valid JSON: %v", err),
+			}
+		}
+
+		// Validate structure
+		if err := ValidateArgumentStructure(args); err != nil {
+			return &runtime.ToolError{
+				Kind:    runtime.ErrorInvalidArguments,
+				Message: fmt.Sprintf("invalid arguments: %v", err),
+			}
 		}
 	}
 

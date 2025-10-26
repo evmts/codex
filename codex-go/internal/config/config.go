@@ -5,9 +5,12 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/evmts/codex/codex-go/internal/models"
@@ -127,6 +130,73 @@ type MCPServerConfig struct {
 	OAuth *MCPOAuthConfig `toml:"oauth"`
 }
 
+// Validate checks if the MCPServerConfig is valid
+func (m *MCPServerConfig) Validate() error {
+	// Ensure exactly one transport type is configured
+	hasCommand := m.Command != ""
+	hasURL := m.URL != ""
+
+	if !hasCommand && !hasURL {
+		return fmt.Errorf("must specify either command or url")
+	}
+	if hasCommand && hasURL {
+		return fmt.Errorf("cannot specify both command and url")
+	}
+
+	// Validate stdio transport
+	if hasCommand {
+		// Prevent path traversal in command
+		if strings.Contains(m.Command, "..") {
+			return fmt.Errorf("command cannot contain path traversal (..) : %s", m.Command)
+		}
+		// Validate command exists and is executable
+		if !filepath.IsAbs(m.Command) {
+			if _, err := exec.LookPath(m.Command); err != nil {
+				return fmt.Errorf("command not found in PATH: %s", m.Command)
+			}
+		}
+		// Validate CWD if specified
+		if m.CWD != "" {
+			if strings.Contains(m.CWD, "..") {
+				return fmt.Errorf("cwd cannot contain path traversal (..): %s", m.CWD)
+			}
+			if info, err := os.Stat(m.CWD); err != nil {
+				return fmt.Errorf("cwd does not exist: %s", m.CWD)
+			} else if !info.IsDir() {
+				return fmt.Errorf("cwd is not a directory: %s", m.CWD)
+			}
+		}
+	}
+
+	// Validate HTTP transport
+	if hasURL {
+		if _, err := url.Parse(m.URL); err != nil {
+			return fmt.Errorf("invalid url: %w", err)
+		}
+		// Ensure URL uses https
+		if u, _ := url.Parse(m.URL); u.Scheme != "https" && u.Scheme != "http" {
+			return fmt.Errorf("url must use http or https scheme: %s", m.URL)
+		}
+	}
+
+	// Validate timeouts
+	if m.StartupTimeoutSec != nil && *m.StartupTimeoutSec <= 0 {
+		return fmt.Errorf("startup_timeout_sec must be positive")
+	}
+	if m.ToolTimeoutSec != nil && *m.ToolTimeoutSec <= 0 {
+		return fmt.Errorf("tool_timeout_sec must be positive")
+	}
+
+	// Validate OAuth config if present
+	if m.OAuth != nil {
+		if err := m.OAuth.Validate(); err != nil {
+			return fmt.Errorf("oauth: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // MCPOAuthConfig defines OAuth 2.0 configuration for an MCP server
 type MCPOAuthConfig struct {
 	// ClientID is the OAuth 2.0 client identifier
@@ -149,6 +219,39 @@ type MCPOAuthConfig struct {
 
 	// UsePKCE enables PKCE (Proof Key for Code Exchange)
 	UsePKCE bool `toml:"use_pkce"`
+}
+
+// Validate checks if the MCPOAuthConfig is valid
+func (o *MCPOAuthConfig) Validate() error {
+	if o.ClientID == "" {
+		return fmt.Errorf("client_id cannot be empty")
+	}
+
+	// If using discovery, AuthURL and TokenURL should not be set
+	if o.UseDiscovery {
+		if o.AuthURL != "" || o.TokenURL != "" {
+			return fmt.Errorf("cannot specify auth_url or token_url when use_discovery is true")
+		}
+	} else {
+		// If not using discovery, both URLs must be set
+		if o.AuthURL == "" || o.TokenURL == "" {
+			return fmt.Errorf("auth_url and token_url are required when use_discovery is false")
+		}
+		// Validate URLs
+		if _, err := url.Parse(o.AuthURL); err != nil {
+			return fmt.Errorf("invalid auth_url: %w", err)
+		}
+		if _, err := url.Parse(o.TokenURL); err != nil {
+			return fmt.Errorf("invalid token_url: %w", err)
+		}
+	}
+
+	// Scopes should not be empty
+	if len(o.Scopes) == 0 {
+		return fmt.Errorf("scopes cannot be empty")
+	}
+
+	return nil
 }
 
 // NotifyConfig contains notification configurations.
@@ -179,6 +282,62 @@ type NotifyTriggerConfig struct {
 
 	// Env contains additional environment variables for the script
 	Env map[string]string `toml:"env"`
+}
+
+// Validate checks if the NotifyConfig is valid
+func (n *NotifyConfig) Validate() error {
+	if n.ScriptTimeoutSec != nil && *n.ScriptTimeoutSec <= 0 {
+		return fmt.Errorf("script_timeout_sec must be positive")
+	}
+
+	if n.OnTurnComplete != nil {
+		if err := n.OnTurnComplete.Validate(); err != nil {
+			return fmt.Errorf("on_turn_complete: %w", err)
+		}
+	}
+	if n.OnError != nil {
+		if err := n.OnError.Validate(); err != nil {
+			return fmt.Errorf("on_error: %w", err)
+		}
+	}
+	if n.OnApprovalNeeded != nil {
+		if err := n.OnApprovalNeeded.Validate(); err != nil {
+			return fmt.Errorf("on_approval_needed: %w", err)
+		}
+	}
+	if n.OnTurnAborted != nil {
+		if err := n.OnTurnAborted.Validate(); err != nil {
+			return fmt.Errorf("on_turn_aborted: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// Validate checks if the NotifyTriggerConfig is valid
+func (t *NotifyTriggerConfig) Validate() error {
+	if t.Enabled && t.Command == "" {
+		return fmt.Errorf("command cannot be empty when enabled is true")
+	}
+
+	if t.Command != "" {
+		// Prevent path traversal
+		if strings.Contains(t.Command, "..") {
+			return fmt.Errorf("command cannot contain path traversal (..): %s", t.Command)
+		}
+	}
+
+	// Validate environment variable keys
+	for key := range t.Env {
+		if key == "" {
+			return fmt.Errorf("environment variable key cannot be empty")
+		}
+		if strings.ContainsAny(key, "=\x00") {
+			return fmt.Errorf("environment variable key contains invalid characters: %s", key)
+		}
+	}
+
+	return nil
 }
 
 // configTOML represents the raw configuration structure from TOML file
@@ -431,6 +590,38 @@ func (c *Config) Validate() error {
 		if !validPolicies[c.ApprovalPolicy] {
 			return fmt.Errorf("configuration error: invalid approval_policy '%s'. Must be one of: 'auto', 'always', or 'never'", c.ApprovalPolicy)
 		}
+	}
+
+	// Validate MCP servers
+	for name, server := range c.MCPServers {
+		if err := server.Validate(); err != nil {
+			return fmt.Errorf("mcp_servers[%s]: %w", name, err)
+		}
+	}
+
+	// Validate notification config (always validates, even if empty struct)
+	if err := c.Notify.Validate(); err != nil {
+		return fmt.Errorf("notify: %w", err)
+	}
+
+	// Validate WebSearchProvider if enabled
+	if c.WebSearchEnabled {
+		if c.WebSearchProvider == "" {
+			return fmt.Errorf("web_search_provider cannot be empty when web_search_enabled is true")
+		}
+		validProviders := map[string]bool{
+			"duckduckgo": true,
+			"google":     true,
+		}
+		if !validProviders[c.WebSearchProvider] {
+			return fmt.Errorf("invalid web_search_provider '%s'. Must be one of: duckduckgo, google", c.WebSearchProvider)
+		}
+	}
+
+	// Validate ProjectDocMaxBytes has reasonable limits
+	const MaxProjectDocSize = 10 * 1024 * 1024 // 10MB
+	if c.ProjectDocMaxBytes > MaxProjectDocSize {
+		return fmt.Errorf("project_doc_max_bytes exceeds maximum of %d bytes (10MB)", MaxProjectDocSize)
 	}
 
 	return nil

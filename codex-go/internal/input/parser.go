@@ -6,7 +6,27 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
+
+const (
+	MaxFileSize           = 10 * 1024 * 1024 // 10MB max file size
+	MaxReferencesPerInput = 50               // Max @ references per input
+)
+
+// Sensitive paths that should never be accessed
+var sensitivePaths = []string{
+	"/etc/shadow",
+	"/etc/passwd",
+	"/root",
+	"/.ssh",
+	"/var/log",
+	"/private/etc/shadow", // macOS: /etc is symlink to /private/etc
+	"/private/etc/passwd",
+	"/private/var/log",
+}
 
 // FileReference represents a parsed file reference from @ syntax
 type FileReference struct {
@@ -42,6 +62,12 @@ func ParseFileReferences(input string, workingDir string) (*ParseResult, error) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to get working directory: %w", err)
 		}
+	}
+
+	// Limit the number of @ references to prevent DoS
+	refCount := strings.Count(input, "@")
+	if refCount > MaxReferencesPerInput {
+		return nil, fmt.Errorf("too many file references: %d (max %d)", refCount, MaxReferencesPerInput)
 	}
 
 	var refs []FileReference
@@ -93,21 +119,34 @@ func extractFileReference(input string, startIdx int, workingDir string) (FileRe
 	var endIdx int
 
 	if i < len(input) && input[i] == '"' {
-		// Quoted path: read until closing quote
+		// Quoted path: read until closing quote, handling escapes
 		i++ // Skip opening quote
-		start := i
+		var pathBuilder strings.Builder
+
 		for i < len(input) && input[i] != '"' {
 			if input[i] == '\\' && i+1 < len(input) {
-				// Handle escaped quotes
-				i += 2
+				// Handle escape sequences
+				switch input[i+1] {
+				case '"', '\\':
+					// Valid escape: \" or \\
+					pathBuilder.WriteByte(input[i+1])
+					i += 2
+				default:
+					// Not a valid escape, keep the backslash
+					pathBuilder.WriteByte(input[i])
+					i++
+				}
 			} else {
+				pathBuilder.WriteByte(input[i])
 				i++
 			}
 		}
+
 		if i >= len(input) {
 			return FileReference{}, 0, fmt.Errorf("unclosed quote in file reference")
 		}
-		pathStr = input[start:i]
+
+		pathStr = pathBuilder.String()
 		i++ // Skip closing quote
 		endIdx = i
 	} else {
@@ -138,11 +177,44 @@ func extractFileReference(input string, startIdx int, workingDir string) (FileRe
 	}, endIdx, nil
 }
 
+// validatePath checks for path encoding attacks
+func validatePath(path string) error {
+	// Check for invalid UTF-8
+	if !utf8.ValidString(path) {
+		return fmt.Errorf("path contains invalid UTF-8")
+	}
+
+	// Check for unicode normalization attacks
+	// Paths with different normalizations could bypass checks
+	normalized := norm.NFC.String(path)
+	if normalized != path {
+		return fmt.Errorf("path requires unicode normalization")
+	}
+
+	return nil
+}
+
 // resolvePath resolves a file path to absolute path and validates it
 // Returns (absolutePath, displayName, error)
 func resolvePath(path string, workingDir string) (string, string, error) {
 	if path == "" {
 		return "", "", fmt.Errorf("empty path")
+	}
+
+	// Check for null bytes
+	if strings.Contains(path, "\x00") {
+		return "", "", fmt.Errorf("path contains null byte")
+	}
+
+	// Validate path encoding
+	if err := validatePath(path); err != nil {
+		return "", "", err
+	}
+
+	// Resolve working directory symlinks first for consistent comparison
+	resolvedWorkingDir := workingDir
+	if resolved, err := filepath.EvalSymlinks(workingDir); err == nil {
+		resolvedWorkingDir = resolved
 	}
 
 	// Security: prevent path traversal attacks
@@ -153,14 +225,43 @@ func resolvePath(path string, workingDir string) (string, string, error) {
 	if filepath.IsAbs(cleaned) {
 		absPath = cleaned
 	} else {
-		absPath = filepath.Join(workingDir, cleaned)
+		absPath = filepath.Join(resolvedWorkingDir, cleaned)
 	}
 
-	// Ensure the resolved path is within working directory or explicitly allowed
-	// This prevents ../../../etc/passwd style attacks
+	// Check against sensitive paths BEFORE resolving symlinks
+	// This prevents access via symlinks like /etc -> /private/etc on macOS
+	absPathSlash := filepath.ToSlash(absPath)
+	for _, sensitivePath := range sensitivePaths {
+		if strings.HasPrefix(absPathSlash, sensitivePath) || absPathSlash == strings.TrimPrefix(sensitivePath, "/") {
+			return "", "", fmt.Errorf("access to sensitive path not allowed: %s", path)
+		}
+	}
+
+	// Evaluate symlinks to detect symlink attacks
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		// If error is "not exist", try without evaluating symlinks for better error message
+		if !os.IsNotExist(err) {
+			return "", "", fmt.Errorf("cannot resolve symlinks: %w", err)
+		}
+		resolvedPath = absPath
+	} else {
+		absPath = resolvedPath
+	}
+
+	// Check against sensitive paths AFTER resolving symlinks too
+	// This catches symlinks that resolve to sensitive locations
+	absPathSlash = filepath.ToSlash(absPath)
+	for _, sensitivePath := range sensitivePaths {
+		if strings.HasPrefix(absPathSlash, sensitivePath) || absPathSlash == strings.TrimPrefix(sensitivePath, "/") {
+			return "", "", fmt.Errorf("access to sensitive path not allowed: %s", path)
+		}
+	}
+
+	// Ensure the resolved path is within working directory for relative paths
 	if !filepath.IsAbs(path) {
 		// For relative paths, ensure they don't escape working directory
-		relPath, err := filepath.Rel(workingDir, absPath)
+		relPath, err := filepath.Rel(resolvedWorkingDir, absPath)
 		if err != nil || strings.HasPrefix(relPath, "..") {
 			return "", "", fmt.Errorf("path traversal not allowed: %s", path)
 		}
@@ -178,6 +279,11 @@ func resolvePath(path string, workingDir string) (string, string, error) {
 	// Ensure it's a regular file, not a directory
 	if info.IsDir() {
 		return "", "", fmt.Errorf("path is a directory, not a file: %s", path)
+	}
+
+	// Check file size to prevent DoS
+	if info.Size() > MaxFileSize {
+		return "", "", fmt.Errorf("file too large: %d bytes (max %d bytes)", info.Size(), MaxFileSize)
 	}
 
 	// Use original path as display name if relative, otherwise use basename

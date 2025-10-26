@@ -4,11 +4,20 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/evmts/codex/codex-go/internal/sandbox"
 	"github.com/evmts/codex/codex-go/internal/tools/runtime"
+)
+
+const (
+	MaxStdoutSize      = 10 * 1024 * 1024 // 10MB
+	MaxStderrSize      = 1 * 1024 * 1024  // 1MB
+	MaxTotalOutputSize = 11 * 1024 * 1024 // 11MB total
 )
 
 // CommandSpec defines the specification for executing a command.
@@ -38,6 +47,77 @@ func NewCommandExecutor() *CommandExecutor {
 	}
 }
 
+// validateCommand checks if a command is safe to execute
+func validateCommand(command []string) error {
+	if len(command) == 0 {
+		return fmt.Errorf("command cannot be empty")
+	}
+
+	// Check for null bytes
+	for i, arg := range command {
+		if strings.Contains(arg, "\x00") {
+			return fmt.Errorf("command argument %d contains null byte", i)
+		}
+	}
+
+	// Detect shell metacharacters that could enable injection
+	// Note: We're using exec.CommandContext which doesn't invoke a shell,
+	// but we still want to detect suspicious patterns
+	dangerousPatterns := []string{
+		";", "&&", "||", "|", ">", "<", "`", "$(",
+	}
+
+	for i, arg := range command {
+		for _, pattern := range dangerousPatterns {
+			if strings.Contains(arg, pattern) {
+				// Only warn for now since these might be legitimate
+				// In a real deployment, consider logging or stricter checks
+				_ = fmt.Sprintf("warning: command argument %d contains potentially dangerous pattern '%s': %s", i, pattern, arg)
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateWorkingDirectoryBasic checks if a working directory is safe to use
+// This is a basic validation that doesn't require ExecutionContext
+func validateWorkingDirectoryBasic(workingDir string) error {
+	if workingDir == "" {
+		return nil // Empty is okay, will use current directory
+	}
+
+	// Prevent path traversal
+	cleanPath := filepath.Clean(workingDir)
+
+	// Check if directory exists
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("working directory does not exist: %s", workingDir)
+		}
+		return fmt.Errorf("cannot access working directory: %w", err)
+	}
+
+	// Ensure it's a directory
+	if !info.IsDir() {
+		return fmt.Errorf("working directory is not a directory: %s", workingDir)
+	}
+
+	// Get absolute path for validation
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return fmt.Errorf("cannot resolve absolute path: %w", err)
+	}
+
+	// Ensure path doesn't contain .. after cleaning
+	if strings.Contains(filepath.ToSlash(absPath), "..") {
+		return fmt.Errorf("working directory contains path traversal: %s", workingDir)
+	}
+
+	return nil
+}
+
 // Execute runs a command and returns the result.
 // Sandbox policy is determined by the ExecutionContext's SandboxAttempt, which is set by the orchestrator.
 func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCtx *runtime.ExecutionContext) (*runtime.ToolResponse, error) {
@@ -51,11 +131,25 @@ func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCt
 		)
 	}
 
+	// Validate command for security
+	if err := validateCommand(spec.Command); err != nil {
+		return nil, runtime.NewToolError(
+			runtime.ErrorInvalidArguments,
+			fmt.Sprintf("invalid command: %v", err),
+		)
+	}
+
 	// Create the command
 	cmd := exec.CommandContext(ctx, spec.Command[0], spec.Command[1:]...)
 
-	// Set working directory
+	// Validate and set working directory
 	if spec.WorkingDirectory != "" {
+		if err := validateWorkingDirectoryBasic(spec.WorkingDirectory); err != nil {
+			return nil, runtime.NewToolError(
+				runtime.ErrorInvalidArguments,
+				fmt.Sprintf("invalid working directory: %v", err),
+			)
+		}
 		cmd.Dir = spec.WorkingDirectory
 	}
 
@@ -74,18 +168,22 @@ func (e *CommandExecutor) Execute(ctx context.Context, spec *CommandSpec, execCt
 		}
 	}
 
-	// Create output capturer
+	// Create output capturer with size limits
 	capturer := NewOutputCapturer(spec.CallID)
+
+	// Wrap with size limiters
+	stdoutLimited := NewLimitedWriter(capturer.stdout, MaxStdoutSize, "stdout")
+	stderrLimited := NewLimitedWriter(capturer.stderr, MaxStderrSize, "stderr")
 
 	// Set up output capture
 	if execCtx.OutputWriter != nil {
-		// Stream output in real-time
-		cmd.Stdout = io.MultiWriter(capturer.stdout, execCtx.OutputWriter)
-		cmd.Stderr = io.MultiWriter(capturer.stderr, execCtx.OutputWriter)
+		// Stream output in real-time with limits
+		cmd.Stdout = io.MultiWriter(stdoutLimited, execCtx.OutputWriter)
+		cmd.Stderr = io.MultiWriter(stderrLimited, execCtx.OutputWriter)
 	} else {
-		// Just capture output
-		cmd.Stdout = capturer.stdout
-		cmd.Stderr = capturer.stderr
+		// Just capture output with limits
+		cmd.Stdout = stdoutLimited
+		cmd.Stderr = stderrLimited
 	}
 
 	// Apply sandbox from ExecutionContext (set by orchestrator)

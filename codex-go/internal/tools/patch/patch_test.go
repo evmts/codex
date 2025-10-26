@@ -562,8 +562,21 @@ func TestApplyPatch_PathTraversal_Blocked(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			patches, err := parseUnifiedDiff(tt.diff)
-			require.NoError(t, err)
+			patches, parseErr := parseUnifiedDiff(tt.diff)
+
+			// Absolute paths should fail at parse time (defense in depth)
+			// Relative paths with .. will fail at apply time (depends on AllowOutsideRoot)
+			if strings.Contains(tt.diff, "+++ /") || strings.Contains(tt.diff, "--- /") && !strings.Contains(tt.diff, "/dev/null") {
+				// Absolute path - should fail at parse time
+				require.Error(t, parseErr)
+				errMsg := strings.ToLower(parseErr.Error())
+				assert.True(t, strings.Contains(errMsg, "absolute paths"),
+					"error should indicate absolute path issue: %s", parseErr.Error())
+				return
+			}
+
+			// Relative path traversal - should fail at apply time
+			require.NoError(t, parseErr)
 
 			result, err := applyPatches(fs, patches, "/workspace", false)
 			require.Error(t, err)
@@ -572,7 +585,6 @@ func TestApplyPatch_PathTraversal_Blocked(t *testing.T) {
 			// Error should indicate path traversal or security issue
 			errMsg := strings.ToLower(err.Error())
 			assert.True(t, strings.Contains(errMsg, "outside root") ||
-				strings.Contains(errMsg, "absolute paths") ||
 				strings.Contains(errMsg, "path traversal"),
 				"error should indicate path security issue: %s", err.Error())
 		})

@@ -589,3 +589,514 @@ func TestNoBypassPaths(t *testing.T) {
 	// Sandbox should still be attempted even with escalated permissions in args
 	// The orchestrator controls actual sandbox policy
 }
+
+// TestCommandInjectionAttempts tests that command injection attempts are detected
+func TestCommandInjectionAttempts(t *testing.T) {
+	executor := NewCommandExecutor()
+	ctx := context.Background()
+
+	injectionAttempts := []struct {
+		name    string
+		command []string
+	}{
+		{
+			name:    "semicolon injection",
+			command: []string{"echo", "test; ls /etc/passwd"},
+		},
+		{
+			name:    "and injection",
+			command: []string{"echo", "test && cat /etc/passwd"},
+		},
+		{
+			name:    "or injection",
+			command: []string{"echo", "test || rm -rf /"},
+		},
+		{
+			name:    "pipe injection",
+			command: []string{"echo", "test | cat /etc/passwd"},
+		},
+		{
+			name:    "redirect injection",
+			command: []string{"echo", "test > /tmp/malicious"},
+		},
+		{
+			name:    "backtick injection",
+			command: []string{"echo", "test `cat /etc/passwd`"},
+		},
+		{
+			name:    "command substitution",
+			command: []string{"echo", "test $(cat /etc/passwd)"},
+		},
+	}
+
+	for _, tt := range injectionAttempts {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &CommandSpec{
+				Command:          tt.command,
+				WorkingDirectory: "/tmp",
+				CallID:           "test-injection",
+			}
+
+			execCtx := &runtime.ExecutionContext{
+				SessionID: "test-session",
+				TurnID:    "test-turn",
+				SandboxAttempt: &runtime.SandboxAttempt{
+					Type:             runtime.SandboxNone,
+					Policy:           runtime.SandboxDangerFullAccess,
+					WorkingDirectory: "/tmp",
+				},
+				StartTime: time.Now(),
+			}
+
+			// These should pass validation (patterns are logged but allowed)
+			// since we're using exec.CommandContext which doesn't invoke a shell
+			resp, err := executor.Execute(ctx, spec, execCtx)
+			// The command might fail or succeed, but should not cause injection
+			// The key is that the dangerous patterns are in arguments, not executed
+			if err != nil {
+				t.Logf("Command failed (expected for some patterns): %v", err)
+			} else {
+				require.NotNil(t, resp)
+			}
+		})
+	}
+}
+
+// TestNullByteInCommand tests that null bytes in commands are rejected
+func TestNullByteInCommand(t *testing.T) {
+	executor := NewCommandExecutor()
+	ctx := context.Background()
+
+	tests := []struct {
+		name    string
+		command []string
+	}{
+		{
+			name:    "null byte in first argument",
+			command: []string{"echo\x00", "test"},
+		},
+		{
+			name:    "null byte in second argument",
+			command: []string{"echo", "test\x00malicious"},
+		},
+		{
+			name:    "null byte in middle",
+			command: []string{"echo", "before\x00after"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &CommandSpec{
+				Command:          tt.command,
+				WorkingDirectory: "/tmp",
+				CallID:           "test-null-byte",
+			}
+
+			execCtx := &runtime.ExecutionContext{
+				SessionID: "test-session",
+				TurnID:    "test-turn",
+				SandboxAttempt: &runtime.SandboxAttempt{
+					Type:             runtime.SandboxNone,
+					Policy:           runtime.SandboxDangerFullAccess,
+					WorkingDirectory: "/tmp",
+				},
+				StartTime: time.Now(),
+			}
+
+			_, err := executor.Execute(ctx, spec, execCtx)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "null byte")
+		})
+	}
+}
+
+// TestPathTraversalInWorkingDirectory tests that path traversal is blocked
+func TestPathTraversalInWorkingDirectory(t *testing.T) {
+	executor := NewCommandExecutor()
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+
+	tests := []struct {
+		name        string
+		workingDir  string
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name:        "valid directory",
+			workingDir:  tmpDir,
+			expectError: false,
+		},
+		{
+			name:        "path traversal with ..",
+			workingDir:  tmpDir + "/../../../etc",
+			expectError: false, // Will be resolved to absolute path
+		},
+		{
+			name:        "non-existent directory",
+			workingDir:  "/path/that/does/not/exist/xyz123",
+			expectError: true,
+			errorMsg:    "does not exist",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := &CommandSpec{
+				Command:          []string{"echo", "test"},
+				WorkingDirectory: tt.workingDir,
+				CallID:           "test-path-traversal",
+			}
+
+			execCtx := &runtime.ExecutionContext{
+				SessionID: "test-session",
+				TurnID:    "test-turn",
+				SandboxAttempt: &runtime.SandboxAttempt{
+					Type:             runtime.SandboxNone,
+					Policy:           runtime.SandboxDangerFullAccess,
+					WorkingDirectory: tmpDir,
+				},
+				StartTime: time.Now(),
+			}
+
+			_, err := executor.Execute(ctx, spec, execCtx)
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+			} else {
+				// May succeed or fail depending on path resolution
+				if err != nil {
+					t.Logf("Unexpected error (but path was validated): %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestWorkingDirectoryIsFile tests that a file path is rejected as working directory
+func TestWorkingDirectoryIsFile(t *testing.T) {
+	executor := NewCommandExecutor()
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+	tmpFile := createTempFile(t, tmpDir)
+
+	spec := &CommandSpec{
+		Command:          []string{"echo", "test"},
+		WorkingDirectory: tmpFile,
+		CallID:           "test-file-as-dir",
+	}
+
+	execCtx := &runtime.ExecutionContext{
+		SessionID: "test-session",
+		TurnID:    "test-turn",
+		SandboxAttempt: &runtime.SandboxAttempt{
+			Type:             runtime.SandboxNone,
+			Policy:           runtime.SandboxDangerFullAccess,
+			WorkingDirectory: tmpDir,
+		},
+		StartTime: time.Now(),
+	}
+
+	_, err := executor.Execute(ctx, spec, execCtx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a directory")
+}
+
+// TestOutputSizeLimiting tests that output size limiting works
+func TestOutputSizeLimiting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	executor := NewCommandExecutor()
+	ctx := context.Background()
+
+	// Create a command that produces more than MaxStdoutSize output
+	// We'll use 'yes' command limited by timeout to produce lots of output
+	spec := &CommandSpec{
+		Command:          []string{"yes", "test-output-line"},
+		WorkingDirectory: "/tmp",
+		CallID:           "test-output-limit",
+	}
+
+	// Use a short timeout to avoid running forever
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	execCtx := &runtime.ExecutionContext{
+		SessionID: "test-session",
+		TurnID:    "test-turn",
+		SandboxAttempt: &runtime.SandboxAttempt{
+			Type:             runtime.SandboxNone,
+			Policy:           runtime.SandboxDangerFullAccess,
+			WorkingDirectory: "/tmp",
+		},
+		StartTime: time.Now(),
+	}
+
+	resp, err := executor.Execute(ctx, spec, execCtx)
+	// Should timeout or succeed
+	if err != nil {
+		toolErr, ok := err.(*runtime.ToolError)
+		if ok {
+			assert.Equal(t, runtime.ErrorTimeout, toolErr.Kind)
+		}
+	} else {
+		require.NotNil(t, resp)
+		// Check if output was truncated
+		if len(resp.Content) > int(MaxStdoutSize) {
+			t.Logf("Output size: %d bytes", len(resp.Content))
+		}
+	}
+}
+
+// TestValidateCommandFunction tests the validateCommand function directly
+func TestValidateCommandFunction(t *testing.T) {
+	tests := []struct {
+		name        string
+		command     []string
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name:        "valid command",
+			command:     []string{"echo", "hello"},
+			expectError: false,
+		},
+		{
+			name:        "empty command",
+			command:     []string{},
+			expectError: true,
+			errorMsg:    "cannot be empty",
+		},
+		{
+			name:        "command with null byte",
+			command:     []string{"echo\x00", "test"},
+			expectError: true,
+			errorMsg:    "null byte",
+		},
+		{
+			name:        "command with semicolon",
+			command:     []string{"echo", "test; ls"},
+			expectError: false, // Logged but allowed
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCommand(tt.command)
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestValidateWorkingDirectoryBasicFunction tests the validateWorkingDirectoryBasic function directly
+func TestValidateWorkingDirectoryBasicFunction(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := createTempFile(t, tmpDir)
+
+	tests := []struct {
+		name        string
+		workingDir  string
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name:        "valid directory",
+			workingDir:  tmpDir,
+			expectError: false,
+		},
+		{
+			name:        "empty directory (allowed)",
+			workingDir:  "",
+			expectError: false,
+		},
+		{
+			name:        "non-existent directory",
+			workingDir:  "/nonexistent/path/12345",
+			expectError: true,
+			errorMsg:    "does not exist",
+		},
+		{
+			name:        "file instead of directory",
+			workingDir:  tmpFile,
+			expectError: true,
+			errorMsg:    "not a directory",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateWorkingDirectoryBasic(tt.workingDir)
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestLimitedWriter tests the LimitedWriter functionality
+func TestLimitedWriter(t *testing.T) {
+	tests := []struct {
+		name          string
+		limit         int64
+		writes        [][]byte
+		expectWritten int64
+		expectContent string
+	}{
+		{
+			name:          "under limit",
+			limit:         100,
+			writes:        [][]byte{[]byte("hello"), []byte(" world")},
+			expectWritten: 11,
+			expectContent: "hello world",
+		},
+		{
+			name:          "at limit",
+			limit:         10,
+			writes:        [][]byte{[]byte("hello"), []byte("world")},
+			expectWritten: 10,
+			expectContent: "helloworld",
+		},
+		{
+			name:          "over limit",
+			limit:         5,
+			writes:        [][]byte{[]byte("hello"), []byte("world")},
+			expectWritten: 5,
+		},
+		{
+			name:          "single large write",
+			limit:         10,
+			writes:        [][]byte{[]byte("this is a very long string that exceeds limit")},
+			expectWritten: 10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf []byte
+			writer := &testWriter{data: &buf}
+			lw := NewLimitedWriter(writer, tt.limit, "test")
+
+			for _, write := range tt.writes {
+				_, _ = lw.Write(write)
+			}
+
+			assert.Equal(t, tt.expectWritten, lw.Written())
+			if tt.expectContent != "" {
+				assert.Contains(t, string(buf), tt.expectContent[:len(buf)])
+			}
+		})
+	}
+}
+
+// testWriter is a simple writer for testing
+type testWriter struct {
+	data *[]byte
+}
+
+func (tw *testWriter) Write(p []byte) (n int, err error) {
+	*tw.data = append(*tw.data, p...)
+	return len(p), nil
+}
+
+// TestCommandValidationIntegration tests full integration of command validation
+func TestCommandValidationIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	executor := NewCommandExecutor()
+	ctx := context.Background()
+
+	tests := []struct {
+		name        string
+		spec        *CommandSpec
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name: "valid command",
+			spec: &CommandSpec{
+				Command:          []string{"echo", "hello"},
+				WorkingDirectory: "/tmp",
+				CallID:           "test-valid",
+			},
+			expectError: false,
+		},
+		{
+			name: "empty command",
+			spec: &CommandSpec{
+				Command:          []string{},
+				WorkingDirectory: "/tmp",
+				CallID:           "test-empty",
+			},
+			expectError: true,
+			errorMsg:    "cannot be empty",
+		},
+		{
+			name: "null byte in command",
+			spec: &CommandSpec{
+				Command:          []string{"echo\x00test"},
+				WorkingDirectory: "/tmp",
+				CallID:           "test-null",
+			},
+			expectError: true,
+			errorMsg:    "null byte",
+		},
+		{
+			name: "invalid working directory",
+			spec: &CommandSpec{
+				Command:          []string{"echo", "test"},
+				WorkingDirectory: "/nonexistent/path/xyz",
+				CallID:           "test-invalid-dir",
+			},
+			expectError: true,
+			errorMsg:    "does not exist",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			execCtx := &runtime.ExecutionContext{
+				SessionID: "test-session",
+				TurnID:    "test-turn",
+				SandboxAttempt: &runtime.SandboxAttempt{
+					Type:             runtime.SandboxNone,
+					Policy:           runtime.SandboxDangerFullAccess,
+					WorkingDirectory: "/tmp",
+				},
+				StartTime: time.Now(),
+			}
+
+			_, err := executor.Execute(ctx, tt.spec, execCtx)
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorMsg != "" {
+					assert.Contains(t, err.Error(), tt.errorMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}

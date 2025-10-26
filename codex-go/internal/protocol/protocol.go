@@ -26,6 +26,36 @@ const (
 	UserInputTypePath     = "path"
 )
 
+// Decision values for approval responses
+const (
+	DecisionApproved           = "approved"
+	DecisionApprovedForSession = "approved_for_session"
+	DecisionDenied             = "denied"
+	DecisionAbort              = "abort"
+)
+
+// ApprovalPolicy values
+const (
+	ApprovalPolicyAuto   = "auto"
+	ApprovalPolicyAlways = "always"
+	ApprovalPolicyNever  = "never"
+)
+
+// SandboxPolicy mode values
+const (
+	SandboxModeReadOnly         = "read-only"
+	SandboxModeWorkspaceWrite   = "workspace-write"
+	SandboxModeDangerFullAccess = "danger-full-access"
+)
+
+// Summary values
+const (
+	SummaryNone   = "none"
+	SummaryLow    = "low"
+	SummaryMedium = "medium"
+	SummaryHigh   = "high"
+)
+
 // Submission represents a request from the user to the agent.
 // It wraps an Op with a unique ID for correlation with events.
 type Submission struct {
@@ -112,6 +142,39 @@ func (o *OpUserTurn) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// Validate checks if the OpUserTurn is valid
+func (o *OpUserTurn) Validate() error {
+	if len(o.Items) == 0 {
+		return fmt.Errorf("items cannot be empty")
+	}
+	if len(o.Items) > 100 {
+		return fmt.Errorf("items exceeds maximum of 100")
+	}
+	for i, item := range o.Items {
+		if err := item.Validate(); err != nil {
+			return fmt.Errorf("item %d: %w", i, err)
+		}
+	}
+	if o.Cwd == "" {
+		return fmt.Errorf("cwd cannot be empty")
+	}
+	if o.ApprovalPolicy != "" && o.ApprovalPolicy != ApprovalPolicyAuto &&
+		o.ApprovalPolicy != ApprovalPolicyAlways && o.ApprovalPolicy != ApprovalPolicyNever {
+		return fmt.Errorf("invalid approval_policy: %s", o.ApprovalPolicy)
+	}
+	if err := o.SandboxPolicy.Validate(); err != nil {
+		return fmt.Errorf("sandbox_policy: %w", err)
+	}
+	if o.Model == "" {
+		return fmt.Errorf("model cannot be empty")
+	}
+	if o.Summary != "" && o.Summary != SummaryNone && o.Summary != SummaryLow &&
+		o.Summary != SummaryMedium && o.Summary != SummaryHigh {
+		return fmt.Errorf("invalid summary: %s", o.Summary)
+	}
+	return nil
+}
+
 // OpOverrideTurnContext overrides parts of the persistent turn context for subsequent turns.
 // All fields are optional; when omitted, the existing value is preserved.
 type OpOverrideTurnContext struct {
@@ -155,6 +218,18 @@ func (o *OpExecApproval) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// Validate checks if the OpExecApproval is valid
+func (o *OpExecApproval) Validate() error {
+	if o.ID == "" {
+		return fmt.Errorf("id cannot be empty")
+	}
+	if o.Decision != DecisionApproved && o.Decision != DecisionApprovedForSession &&
+		o.Decision != DecisionDenied && o.Decision != DecisionAbort {
+		return fmt.Errorf("invalid decision: %s", o.Decision)
+	}
+	return nil
+}
+
 // OpPatchApproval approves a code patch.
 type OpPatchApproval struct {
 	// ID is the submission ID being approved
@@ -171,6 +246,18 @@ func (o *OpPatchApproval) MarshalJSON() ([]byte, error) {
 		"id":       o.ID,
 		"decision": o.Decision,
 	})
+}
+
+// Validate checks if the OpPatchApproval is valid
+func (o *OpPatchApproval) Validate() error {
+	if o.ID == "" {
+		return fmt.Errorf("id cannot be empty")
+	}
+	if o.Decision != DecisionApproved && o.Decision != DecisionApprovedForSession &&
+		o.Decision != DecisionDenied && o.Decision != DecisionAbort {
+		return fmt.Errorf("invalid decision: %s", o.Decision)
+	}
+	return nil
 }
 
 // OpAddToHistory appends an entry to the persistent cross-session message history.
@@ -1500,6 +1587,41 @@ type UserInput struct {
 	Path     *string `json:"path,omitempty"`
 }
 
+const (
+	MaxUserInputTextSize = 1 * 1024 * 1024 // 1MB
+	MaxUserInputPathSize = 256 * 1024      // 256KB
+)
+
+// Validate checks if the UserInput is valid
+func (u *UserInput) Validate() error {
+	switch u.Type {
+	case UserInputTypeText:
+		if u.Text == nil {
+			return fmt.Errorf("text is required for type 'text'")
+		}
+		if len(*u.Text) > MaxUserInputTextSize {
+			return fmt.Errorf("text exceeds maximum size of %d bytes", MaxUserInputTextSize)
+		}
+	case UserInputTypeImageURL:
+		if u.ImageURL == nil {
+			return fmt.Errorf("image_url is required for type 'image_url'")
+		}
+		if len(*u.ImageURL) > MaxUserInputPathSize {
+			return fmt.Errorf("image_url exceeds maximum size of %d bytes", MaxUserInputPathSize)
+		}
+	case UserInputTypePath:
+		if u.Path == nil {
+			return fmt.Errorf("path is required for type 'path'")
+		}
+		if len(*u.Path) > MaxUserInputPathSize {
+			return fmt.Errorf("path exceeds maximum size of %d bytes", MaxUserInputPathSize)
+		}
+	default:
+		return fmt.Errorf("invalid type: %s", u.Type)
+	}
+	return nil
+}
+
 // SandboxPolicy determines execution restrictions for model shell commands.
 type SandboxPolicy struct {
 	Mode                string   `json:"mode"`
@@ -1512,7 +1634,7 @@ type SandboxPolicy struct {
 // MarshalJSON implements custom marshaling for SandboxPolicy
 func (s SandboxPolicy) MarshalJSON() ([]byte, error) {
 	// For workspace-write mode, always include all fields
-	if s.Mode == "workspace-write" {
+	if s.Mode == SandboxModeWorkspaceWrite {
 		type Alias SandboxPolicy
 		return json.Marshal(&struct {
 			*Alias
@@ -1524,6 +1646,23 @@ func (s SandboxPolicy) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]interface{}{
 		"mode": s.Mode,
 	})
+}
+
+// Validate checks if the SandboxPolicy is valid
+func (s *SandboxPolicy) Validate() error {
+	if s.Mode != SandboxModeReadOnly && s.Mode != SandboxModeWorkspaceWrite &&
+		s.Mode != SandboxModeDangerFullAccess {
+		return fmt.Errorf("invalid mode: %s", s.Mode)
+	}
+	if s.Mode == SandboxModeWorkspaceWrite {
+		// Validate WritableRoots if provided
+		for i, root := range s.WritableRoots {
+			if root == "" {
+				return fmt.Errorf("writable_roots[%d] cannot be empty", i)
+			}
+		}
+	}
+	return nil
 }
 
 // ReviewRequest represents a code review request.

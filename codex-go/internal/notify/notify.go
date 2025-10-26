@@ -10,6 +10,13 @@ import (
 // DefaultScriptTimeout is the default timeout for notification scripts.
 const DefaultScriptTimeout = 5 * time.Second
 
+const (
+	DefaultNotificationRate = 10  // notifications per second
+	MaxWorkers             = 5    // worker pool size
+	NotificationQueueSize  = 100  // buffered channel size
+	ShutdownTimeout        = 10 * time.Second
+)
+
 // NotificationConfig contains configuration for a specific notification trigger.
 type NotificationConfig struct {
 	// Command is the script command to execute
@@ -42,10 +49,13 @@ type Config struct {
 
 // Notifier manages notification dispatching.
 type Notifier struct {
-	config   *Config
-	executor *ScriptExecutor
-	mu       sync.RWMutex
-	enabled  bool
+	config      *Config
+	executor    *ScriptExecutor
+	workerPool  *WorkerPool
+	rateLimiter *RateLimiter
+	mu          sync.RWMutex
+	enabled     bool
+	closed      bool
 }
 
 // NewNotifier creates a new notification manager with the given configuration.
@@ -60,10 +70,18 @@ func NewNotifier(config *Config) *Notifier {
 		timeout = DefaultScriptTimeout
 	}
 
+	// Create rate limiter
+	rateLimiter := NewRateLimiter(DefaultNotificationRate, DefaultNotificationRate*2)
+
+	// Create worker pool
+	workerPool := NewWorkerPool(MaxWorkers, NotificationQueueSize)
+
 	return &Notifier{
-		config:   config,
-		executor: NewScriptExecutor(timeout),
-		enabled:  true,
+		config:      config,
+		executor:    NewScriptExecutor(timeout),
+		workerPool:  workerPool,
+		rateLimiter: rateLimiter,
+		enabled:     true,
 	}
 }
 
@@ -73,7 +91,7 @@ func (n *Notifier) Notify(ctx context.Context, event *NotificationEvent) error {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
-	if !n.enabled {
+	if !n.enabled || n.closed {
 		return nil
 	}
 
@@ -83,17 +101,38 @@ func (n *Notifier) Notify(ctx context.Context, event *NotificationEvent) error {
 		return nil
 	}
 
+	// Validate command
+	if err := validateNotificationCommand(notifConfig.Command); err != nil {
+		// Log error but don't fail notification
+		_ = fmt.Sprintf("notification command validation failed: %v", err)
+		return nil
+	}
+
+	// Check rate limit
+	if !n.rateLimiter.Allow() {
+		// Rate limit exceeded, drop notification
+		_ = fmt.Sprintf("notification rate limit exceeded, dropping event")
+		return nil
+	}
+
 	// Set up executor environment with configured variables
 	executor := NewScriptExecutor(n.executor.Timeout)
 	for key, value := range notifConfig.Env {
 		executor.SetEnv(key, value)
 	}
 
-	// Execute the script asynchronously
-	// We don't return errors since notifications are fire-and-forget
-	go func() {
-		_ = executor.Execute(ctx, notifConfig.Command, event)
-	}()
+	// Submit to worker pool
+	job := &NotificationJob{
+		ctx:      ctx,
+		config:   notifConfig,
+		event:    event,
+		executor: executor,
+	}
+
+	if err := n.workerPool.Submit(job); err != nil {
+		// Queue full, drop notification
+		_ = fmt.Sprintf("notification queue full, dropping event")
+	}
 
 	return nil
 }
@@ -183,4 +222,20 @@ func (n *Notifier) UpdateConfig(config *Config) error {
 	}
 
 	return nil
+}
+
+// Close gracefully shuts down the notifier
+func (n *Notifier) Close() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.closed {
+		return nil
+	}
+
+	n.closed = true
+	n.enabled = false
+
+	// Shut down worker pool with timeout
+	return n.workerPool.Close(ShutdownTimeout)
 }

@@ -47,6 +47,7 @@ func TestNewNotifier(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			n := NewNotifier(tt.config)
+			defer n.Close()
 			if n == nil {
 				t.Fatal("NewNotifier returned nil")
 			}
@@ -59,6 +60,7 @@ func TestNewNotifier(t *testing.T) {
 
 func TestNotifier_EnableDisable(t *testing.T) {
 	n := NewNotifier(&Config{})
+	defer n.Close()
 
 	if !n.IsEnabled() {
 		t.Error("Notifier should start enabled")
@@ -79,6 +81,7 @@ func TestNotifier_UpdateConfig(t *testing.T) {
 	n := NewNotifier(&Config{
 		ScriptTimeout: 5 * time.Second,
 	})
+	defer n.Close()
 
 	newConfig := &Config{
 		OnTurnComplete: &NotificationConfig{
@@ -100,6 +103,7 @@ func TestNotifier_UpdateConfig(t *testing.T) {
 
 func TestNotifier_UpdateConfig_Nil(t *testing.T) {
 	n := NewNotifier(&Config{})
+	defer n.Close()
 
 	err := n.UpdateConfig(nil)
 	if err == nil {
@@ -114,6 +118,7 @@ func TestNotifier_Notify_Disabled(t *testing.T) {
 			Enabled: true,
 		},
 	})
+	defer n.Close()
 	n.Disable()
 
 	event := NewNotificationEvent(EventTurnComplete, "session1", "turn1")
@@ -125,6 +130,7 @@ func TestNotifier_Notify_Disabled(t *testing.T) {
 
 func TestNotifier_Notify_NoConfig(t *testing.T) {
 	n := NewNotifier(&Config{})
+	defer n.Close()
 
 	event := NewNotificationEvent(EventTurnComplete, "session1", "turn1")
 	err := n.Notify(context.Background(), event)
@@ -140,6 +146,7 @@ func TestNotifier_Notify_DisabledTrigger(t *testing.T) {
 			Enabled: false,
 		},
 	})
+	defer n.Close()
 
 	event := NewNotificationEvent(EventTurnComplete, "session1", "turn1")
 	err := n.Notify(context.Background(), event)
@@ -160,6 +167,7 @@ func TestNotifier_NotifyTurnComplete(t *testing.T) {
 		},
 		ScriptTimeout: 2 * time.Second,
 	})
+	defer n.Close()
 
 	err := n.NotifyTurnComplete(context.Background(), "test-session", "test-turn", "Test message")
 	if err != nil {
@@ -198,6 +206,7 @@ func TestNotifier_NotifyTurnError(t *testing.T) {
 		},
 		ScriptTimeout: 2 * time.Second,
 	})
+	defer n.Close()
 
 	err := n.NotifyTurnError(context.Background(), "test-session", "test-turn", "Test error")
 	if err != nil {
@@ -231,6 +240,7 @@ func TestNotifier_NotifyApprovalNeeded(t *testing.T) {
 			Enabled: true,
 		},
 	})
+	defer n.Close()
 
 	err := n.NotifyApprovalNeeded(context.Background(), "test-session", "test-turn", "bash")
 	if err != nil {
@@ -245,6 +255,7 @@ func TestNotifier_NotifyTurnAborted(t *testing.T) {
 			Enabled: true,
 		},
 	})
+	defer n.Close()
 
 	err := n.NotifyTurnAborted(context.Background(), "test-session", "test-turn", "User interrupted")
 	if err != nil {
@@ -260,6 +271,7 @@ func TestNotifier_ConcurrentNotifications(t *testing.T) {
 		},
 		ScriptTimeout: 1 * time.Second,
 	})
+	defer n.Close()
 
 	var wg sync.WaitGroup
 	concurrency := 10
@@ -292,6 +304,7 @@ func TestNotifier_WithCustomEnv(t *testing.T) {
 		},
 		ScriptTimeout: 2 * time.Second,
 	})
+	defer n.Close()
 
 	err := n.NotifyTurnComplete(context.Background(), "test-session", "test-turn", "Test")
 	if err != nil {
