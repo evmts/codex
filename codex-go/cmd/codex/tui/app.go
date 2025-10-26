@@ -41,6 +41,9 @@ type Model struct {
 	width  int
 	height int
 	ready  bool
+
+	// Event handling
+	eventChan chan *protocol.Event
 }
 
 // PendingToolApproval represents a tool waiting for approval
@@ -76,7 +79,7 @@ func NewModel(mgr manager.ConversationManager) Model {
 
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, m.loadSessions())
 }
 
 // Update handles messages and updates the model
@@ -88,6 +91,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ready = true
+		return m, nil
+
+	case sessionsLoadedMsg:
+		m.sessions = msg.sessions
+		return m, nil
+
+	case sessionCreatedMsg:
+		m.sessions = append(m.sessions, msg.sessionID)
+		m.selectedIdx = len(m.sessions) - 1
 		return m, nil
 
 	case tea.KeyMsg:
@@ -194,7 +206,7 @@ func (m Model) View() string {
 			m.getCurrentSessionID(),
 			m.messages,
 			m.streamingText,
-			m.inputText.Value(),
+			m.inputText.View(),
 		)
 
 	case ViewModeToolApproval:
@@ -202,7 +214,7 @@ func (m Model) View() string {
 			m.getCurrentSessionID(),
 			m.messages,
 			m.streamingText,
-			m.inputText.Value(),
+			m.inputText.View(),
 		)
 		toolPanel := RenderToolApproval(
 			m.pendingTool.ToolName,
@@ -261,9 +273,7 @@ func (m *Model) createNewSession() tea.Cmd {
 			return errorMsg{err: err}
 		}
 
-		m.sessions = append(m.sessions, sessionID)
-		m.selectedIdx = len(m.sessions) - 1
-		return nil
+		return sessionCreatedMsg{sessionID: sessionID}
 	}
 }
 
@@ -337,6 +347,14 @@ func (m *Model) denyTool() {
 
 // Message types for tea.Msg
 
+type sessionsLoadedMsg struct {
+	sessions []string
+}
+
+type sessionCreatedMsg struct {
+	sessionID string
+}
+
 type streamingMsg struct {
 	text string
 	done chan bool
@@ -355,6 +373,13 @@ type errorMsg struct {
 }
 
 // Commands
+
+func (m *Model) loadSessions() tea.Cmd {
+	return func() tea.Msg {
+		sessions := m.conversationMgr.ListSessions()
+		return sessionsLoadedMsg{sessions: sessions}
+	}
+}
 
 func waitForStreaming(done chan bool) tea.Cmd {
 	return func() tea.Msg {

@@ -1,12 +1,12 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 
 	"github.com/evmts/codex/codex-go/cmd/codex/tui"
 	"github.com/evmts/codex/codex-go/internal/client"
+	"github.com/evmts/codex/codex-go/internal/client/openai"
 	"github.com/evmts/codex/codex-go/internal/conversation/manager"
 )
 
@@ -27,36 +27,46 @@ func main() {
 	}
 }
 
-// createManager creates a conversation manager
-// This is a stub that would be replaced with real initialization
+// createManager creates a conversation manager with a real OpenAI client
 func createManager() (manager.ConversationManager, error) {
-	// For now, use a mock client
-	// In production, this would create a real OpenAI client:
-	// import "github.com/evmts/codex/codex-go/internal/client/openai"
-	// client := openai.NewClient(openai.Config{APIKey: os.Getenv("OPENAI_API_KEY"), ...})
+	// Get API key from environment
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		// Also try ANTHROPIC_API_KEY for Claude models
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf("API key required: set OPENAI_API_KEY or ANTHROPIC_API_KEY environment variable")
+	}
+
+	// Get model from environment or use default
+	model := os.Getenv("MODEL")
+	if model == "" {
+		model = "claude-3-5-sonnet-20241022"
+	}
+
+	// Get base URL from environment or use default
+	baseURL := os.Getenv("API_BASE_URL")
+	if baseURL == "" {
+		// Default to Anthropic API
+		baseURL = "https://api.anthropic.com/v1"
+	}
+
+	// Create OpenAI-compatible client
+	clientCfg := client.ClientConfig{
+		BaseURL: baseURL,
+		APIKey:  apiKey,
+		Model:   model,
+	}
+
+	llmClient, err := openai.NewClient(clientCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client: %w", err)
+	}
+
+	// Create manager
 	cfg := manager.ManagerConfig{
-		Client: &mockClient{},
+		Client: llmClient,
 	}
 	return manager.NewManager(cfg)
-}
-
-// mockClient is a stub client for development
-type mockClient struct{}
-
-func (m *mockClient) Stream(ctx context.Context, req *client.ChatCompletionRequest) (<-chan client.StreamEvent, error) {
-	ch := make(chan client.StreamEvent, 10)
-	close(ch)
-	return ch, nil
-}
-
-func (m *mockClient) Complete(ctx context.Context, req *client.ChatCompletionRequest) (*client.ChatCompletionResponse, error) {
-	return nil, fmt.Errorf("mock client not yet implemented")
-}
-
-func (m *mockClient) GetModelContextWindow() int64 {
-	return 200000
-}
-
-func (m *mockClient) GetAutoCompactTokenLimit() int64 {
-	return 0
 }

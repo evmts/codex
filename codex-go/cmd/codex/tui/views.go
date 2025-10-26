@@ -98,7 +98,7 @@ func RenderSessionList(sessions []string, selectedIdx int) string {
 }
 
 // RenderConversation renders the conversation view with messages
-func RenderConversation(sessionID string, messages []Message, streamingText string, inputText string) string {
+func RenderConversation(sessionID string, messages []Message, streamingText string, inputView string) string {
 	var b strings.Builder
 
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Session: %s", sessionID)))
@@ -135,8 +135,8 @@ func RenderConversation(sessionID string, messages []Message, streamingText stri
 		b.WriteString("\n\n")
 	}
 
-	// Render input box
-	b.WriteString(inputStyle.Render("Message: " + inputText))
+	// Render input box - use the actual textinput view
+	b.WriteString(inputView)
 	b.WriteString("\n")
 
 	return b.String()
