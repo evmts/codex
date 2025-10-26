@@ -219,6 +219,100 @@ Successfully deployed **8 parallel agents** to bootstrap the Codex Go rewrite wi
 ⏳ internal/client     - Interfaces only (implementation pending)
 ⏳ internal/tools      - Interfaces only (implementation pending)
 
+## Day 5 Update (Multi-Turn Streaming + Approval Workflow + Enhanced Persistence)
+
+### Multi-Turn Streaming Implementation
+- **Implemented automatic multi-turn streaming** in `internal/conversation/manager/turn.go`:
+  - After tool execution, tool results are automatically fed back to the model as `client.NewToolMessage` messages
+  - Second (and subsequent) streams initiated with full conversation history including tool results
+  - Model generates final assistant response incorporating tool execution results
+  - Multi-turn loop continues until model stops requesting tools
+  - Token usage properly aggregated across all sub-streams (input, output, reasoning)
+- **Refactored streaming architecture**:
+  - Extracted `processSingleStream()` helper for clean single-stream processing
+  - Created `buildRequestWithMessages()` for follow-up requests with conversation history
+  - Modified `executeToolCalls()` to return tool result messages instead of just executing
+  - Added `streamResult` struct to encapsulate stream outputs (message text + tool calls)
+- **Iterative approach**: Uses loop rather than recursion for better stack management
+
+### Approval Workflow Integration
+- **Created `SessionApprovalHandler`** (`internal/conversation/manager/approval_handler.go`):
+  - Bridges orchestrator approval requests to Session state machine
+  - Implements blocking wait for user approval decisions via channels
+  - Supports all approval policies: auto (immediate approval), manual (always request), semi-auto (smart defaults)
+  - Handles approval, denial, session-wide approval, and abort decisions
+- **Added protocol event**: `EventToolCallApprovalNeeded` in `internal/protocol/protocol.go`
+  - Contains: CallID, ToolName, Command, WorkingDirectory, Justification
+  - Includes risk assessment: RiskLevel, RiskReasons, RiskMitigation
+  - Supports retry scenarios with IsRetry and RetryReason fields
+- **Integrated with Session state**:
+  - Added `SetApprovalHandler()`, `GetApprovalHandler()`, `ClearApprovalHandler()` methods to Session
+  - Session transitions to `StateAwaitingApproval` when approval needed
+  - Transitions back to `StateProcessingTurn` after approval decision
+  - Properly cleans up approval handler after turn completion
+- **Manager approval handling**:
+  - `handleExecApproval()` and `handlePatchApproval()` now persist submissions and notify approval handler
+  - Approval decisions unblock waiting orchestrator via channel communication
+
+### Enhanced Persistence & Resumption
+- **All submission types now persisted**:
+  - `OpUserTurn` / `OpUserInput` (already working)
+  - `OpInterrupt` (NEW): Records session interruptions with timestamp
+  - `OpExecApproval` (NEW): Records tool execution approval decisions
+  - `OpPatchApproval` (NEW): Records patch approval decisions
+  - `OpOverrideTurnContext` (NEW): Records turn context changes (cwd, policies, model)
+- **Created comprehensive state reconstruction** (`internal/conversation/manager/history_reconstruct.go`):
+  - `ReconstructStateFromHistory()`: Rebuilds complete conversation state from submissions + events
+    - Reconstructs user, assistant, and tool messages with proper ordering
+    - Tracks turn lifecycle (incomplete turns, interrupted turns)
+    - Extracts token usage from `EventTokenCount` events
+    - Restores turn context from submissions and overrides
+    - Validates session state for safe resumption
+  - `SessionReconstructedState` struct: Contains messages, token usage, turn context, validation flags, and statistics
+  - `ValidateResumedState()`: Ensures resumed sessions are in valid state (rejects pending approvals)
+- **Enhanced ResumeSession**:
+  - Now loads both submissions AND events (previously only events)
+  - Reconstructs fuller conversation state with all messages
+  - Validates state before resuming (incomplete turns allowed, pending approvals rejected)
+  - Properly restores session state, token usage, and last agent message
+
+### New Integration Tests
+- **TestMultiTurnWithToolExecution** (`test/integration/integration_test.go`):
+  - Verifies tool execution followed by automatic second stream with tool results
+  - Asserts final assistant response is generated after tool execution
+  - Validates cumulative token usage across multiple turns
+  - Confirms multi-turn loop completes successfully
+- **TestManualApprovalWorkflow** (`test/integration/integration_test.go`):
+  - Tests approval path: StateIdle → StateProcessingTurn → StateAwaitingApproval → StateProcessingTurn
+  - Tests denial path: StateIdle → StateProcessingTurn → StateAwaitingApproval → StateInterrupted
+  - Verifies `OpExecApproval` submission processing
+  - Confirms approval decisions properly unblock execution
+  - Validates pending approval state is cleared after decision
+- **Created mockMultiTurnClient**: Helper for testing multi-turn scenarios with different responses per stream call
+
+### Build & Test Status
+- ✅ **Build**: `make build` succeeds with all new changes
+- ✅ **Integration Tests**: All 8 tests passing (6 existing + 2 new)
+  - `TestMultiTurnWithToolExecution` - ✅ PASS
+  - `TestManualApprovalWorkflow` - ✅ PASS (2 subtests: approval + denial)
+  - All existing tests continue to pass
+- ✅ **Test Execution Time**: 0.264s for full integration suite
+
+### Edge Cases Handled
+- **Multi-turn**: Infinite loop protection needed (future), empty tool results handled gracefully
+- **Approval**: Context cancellation respected, concurrent approval prevented, handler cleanup on errors
+- **Persistence**: Incomplete turns allowed (resume to idle), interrupted turns tracked, missing events handled best-effort
+
+### Key Files Modified
+- `internal/conversation/manager/turn.go`: Multi-turn streaming loop (lines 64-559)
+- `internal/conversation/manager/approval_handler.go`: NEW FILE (281 lines)
+- `internal/conversation/manager/session.go`: Approval handler lifecycle methods (lines 21-470)
+- `internal/conversation/manager/manager.go`: Enhanced persistence and approval handling (lines 198-415)
+- `internal/conversation/manager/history_reconstruct.go`: NEW FILE (319 lines)
+- `internal/protocol/protocol.go`: EventToolCallApprovalNeeded (lines 582-745)
+- `internal/tools/orchestrator/orchestrator.go`: Registry/cache getters (lines 231-239)
+- `test/integration/integration_test.go`: New tests + mockMultiTurnClient (lines 605-1013)
+
 ## Day 4 Update (Streaming Tools + Persistence)
 
 - Implemented end-to-end streaming tool execution in conversation manager:
