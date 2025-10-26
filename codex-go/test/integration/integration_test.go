@@ -421,7 +421,11 @@ func TestFullSessionWithPersistence(t *testing.T) {
         // Submit second turn via new manager
         require.NoError(t, mgr2.SubmitOp(ctx, "persist-1", op))
 
-        // Close mgr2 to ensure all background work completes (this waits for turn processing to finish)
+        // Wait for turn processing to complete (goroutine needs time to finish)
+        // Note: Close() doesn't wait for background goroutines, so we need explicit wait
+        time.Sleep(200 * time.Millisecond)
+
+        // Close mgr2 after turn completes
         require.NoError(t, mgr2.Close())
 
         // Verify history file exists
