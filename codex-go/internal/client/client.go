@@ -131,14 +131,25 @@ type StreamConfig struct {
 	// EnableRawAgentReasoning, when true, streams reasoning tokens as they arrive.
 	// When false, only emits aggregated reasoning at turn boundaries.
 	EnableRawAgentReasoning bool
+
+	// EnableBackpressure, when true, applies flow control when the event channel is full.
+	// This prevents memory exhaustion from fast streams with slow consumers.
+	// When false, events may be dropped or buffer may grow unbounded depending on implementation.
+	EnableBackpressure bool
+
+	// BackpressureThreshold is the percentage (0.0 to 1.0) of buffer fullness that triggers warnings.
+	// For example, 0.8 means warnings are logged when buffer is 80% full.
+	BackpressureThreshold float64
 }
 
 // DefaultStreamConfig returns sensible defaults for streaming.
 func DefaultStreamConfig() StreamConfig {
 	return StreamConfig{
 		IdleTimeout:             90 * time.Second,
-		BufferSize:              1600,
+		BufferSize:              100,
 		EnableRawAgentReasoning: false,
+		EnableBackpressure:      true,
+		BackpressureThreshold:   0.8,
 	}
 }
 
@@ -183,6 +194,45 @@ func DefaultRetryConfig() RetryConfig {
 // The context can be used to implement timeouts for the refresh operation.
 type TokenRefreshFunc func(ctx context.Context, oldToken string) (newToken string, err error)
 
+// ConnectionPoolConfig controls HTTP connection pooling behavior.
+type ConnectionPoolConfig struct {
+	// MaxIdleConns controls the maximum number of idle (keep-alive) connections across all hosts.
+	// Default: 100
+	MaxIdleConns int
+
+	// MaxIdleConnsPerHost controls the maximum idle (keep-alive) connections to keep per-host.
+	// Default: 10
+	MaxIdleConnsPerHost int
+
+	// MaxConnsPerHost optionally limits the total number of connections per host, including
+	// connections in the dialing, active, and idle states. Default: 0 (unlimited)
+	MaxConnsPerHost int
+
+	// IdleConnTimeout is the maximum amount of time an idle (keep-alive) connection will remain
+	// idle before closing itself. Default: 90 seconds
+	IdleConnTimeout time.Duration
+
+	// ConnectionTimeout is the maximum amount of time to wait for a connection to be established.
+	// This is implemented via TLSHandshakeTimeout. Default: 10 seconds
+	ConnectionTimeout time.Duration
+
+	// EnableHTTP2 controls whether HTTP/2 support is enabled. Default: true
+	EnableHTTP2 bool
+}
+
+// DefaultConnectionPoolConfig returns sensible defaults for connection pooling.
+// These defaults match the Rust reqwest library's behavior.
+func DefaultConnectionPoolConfig() ConnectionPoolConfig {
+	return ConnectionPoolConfig{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		MaxConnsPerHost:     0, // unlimited
+		IdleConnTimeout:     90 * time.Second,
+		ConnectionTimeout:   10 * time.Second,
+		EnableHTTP2:         true,
+	}
+}
+
 // ClientConfig holds configuration for creating a client.
 type ClientConfig struct {
 	// BaseURL is the API endpoint (e.g., "https://api.openai.com/v1")
@@ -202,6 +252,9 @@ type ClientConfig struct {
 
 	// RetryConfig controls retry behavior
 	RetryConfig RetryConfig
+
+	// ConnectionPoolConfig controls HTTP connection pooling
+	ConnectionPoolConfig ConnectionPoolConfig
 
 	// Headers contains additional HTTP headers to include in requests
 	Headers map[string]string

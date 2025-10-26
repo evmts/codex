@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -21,6 +22,44 @@ type streamParser struct {
 func newStreamParser(config client.StreamConfig) *streamParser {
 	return &streamParser{
 		config: config,
+	}
+}
+
+// sendEventWithBackpressure sends an event to the channel with optional backpressure control.
+// It monitors buffer usage and logs warnings when the buffer is consistently full.
+// Returns an error if the context is cancelled or the channel is closed.
+func (p *streamParser) sendEventWithBackpressure(ctx context.Context, eventCh chan<- client.StreamEvent, event client.StreamEvent) error {
+	if !p.config.EnableBackpressure {
+		// No backpressure: try to send immediately, drop if buffer is full
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case eventCh <- event:
+			return nil
+		default:
+			// Buffer full, drop event
+			log.Printf("Warning: Stream buffer full, dropping event (type: %s)", event.Type)
+			return nil
+		}
+	}
+
+	// Backpressure enabled: block until space is available
+	// First, check buffer usage and warn if needed
+	bufferSize := cap(eventCh)
+	currentLen := len(eventCh)
+	usagePercent := float64(currentLen) / float64(bufferSize)
+
+	if usagePercent >= p.config.BackpressureThreshold {
+		log.Printf("Warning: Stream buffer usage high: %d/%d (%.1f%%) - applying backpressure",
+			currentLen, bufferSize, usagePercent*100)
+	}
+
+	// Block until we can send or context is cancelled
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case eventCh <- event:
+		return nil
 	}
 }
 
@@ -100,11 +139,12 @@ func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- cl
 			return ctx.Err()
 
 		case <-idleTimerCh:
-			eventCh <- client.StreamEvent{
+			err := client.NewIdleTimeoutError(p.config.IdleTimeout)
+			_ = p.sendEventWithBackpressure(ctx, eventCh, client.StreamEvent{
 				Type:  client.EventTypeError,
-				Error: client.NewIdleTimeoutError(p.config.IdleTimeout),
-			}
-			return client.NewIdleTimeoutError(p.config.IdleTimeout)
+				Error: err,
+			})
+			return err
 
 		case result := <-scanCh:
 			if !result.ok {
@@ -146,10 +186,8 @@ func (p *streamParser) parse(ctx context.Context, r io.Reader, eventCh chan<- cl
 			// Process chunk and emit events
 			events := p.processChunk(&chunk, toolCallAccumulator)
 			for _, event := range events {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case eventCh <- event:
+				if err := p.sendEventWithBackpressure(ctx, eventCh, event); err != nil {
+					return err
 				}
 			}
 		}
@@ -185,10 +223,26 @@ func (p *streamParser) processChunk(chunk *client.ChatCompletionChunk, accumulat
 		// Handle reasoning delta (if present)
 		if choice.Delta.Reasoning != nil {
 			if p.config.EnableRawAgentReasoning {
-				events = append(events, client.StreamEvent{
-					Type: client.EventTypeReasoningContentDelta,
-					Data: choice.Delta.Reasoning,
-				})
+				// Extract reasoning content text
+				var reasoningText string
+				switch v := choice.Delta.Reasoning.(type) {
+				case string:
+					reasoningText = v
+				case map[string]interface{}:
+					// Handle structured reasoning content (e.g., {"type": "reasoning_content", "text": "..."})
+					if text, ok := v["text"].(string); ok {
+						reasoningText = text
+					} else if content, ok := v["content"].(string); ok {
+						reasoningText = content
+					}
+				}
+
+				if reasoningText != "" {
+					events = append(events, client.StreamEvent{
+						Type: client.EventTypeReasoningContentDelta,
+						Data: reasoningText,
+					})
+				}
 			}
 		}
 

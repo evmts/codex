@@ -22,6 +22,7 @@ type Client struct {
 	config     client.ClientConfig
 	httpClient client.HTTPClient
 	rateLimits *rateLimitTracker
+	metrics    *ConnectionPoolMetrics // Connection pool metrics (optional)
 
 	// Model info cache
 	modelContextWindow    int64
@@ -57,17 +58,23 @@ func NewClient(cfg client.ClientConfig) (*Client, error) {
 	if cfg.RetryConfig.MaxRetries == 0 && len(cfg.RetryConfig.RetryableStatusCodes) == 0 {
 		cfg.RetryConfig = client.DefaultRetryConfig()
 	}
+	if cfg.ConnectionPoolConfig.MaxIdleConns == 0 {
+		cfg.ConnectionPoolConfig = client.DefaultConnectionPoolConfig()
+	}
 
 	// Create default HTTP client if not provided
+	var poolMetrics *ConnectionPoolMetrics
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = newDefaultHTTPClient(cfg.RequestTimeout)
+		poolMetrics = newConnectionPoolMetrics(cfg.ConnectionPoolConfig.MaxIdleConnsPerHost)
+		cfg.HTTPClient = newDefaultHTTPClientWithMetrics(cfg.RequestTimeout, cfg.ConnectionPoolConfig, poolMetrics)
 	}
 
 	c := &Client{
 		config:       cfg,
 		httpClient:   cfg.HTTPClient,
 		rateLimits:   newRateLimitTracker(),
-		currentToken: cfg.APIKey, // Initialize with the provided API key
+		metrics:      poolMetrics, // May be nil if custom HTTPClient provided
+		currentToken: cfg.APIKey,  // Initialize with the provided API key
 	}
 
 	// Initialize model info
@@ -500,21 +507,59 @@ func (c *Client) updateRateLimits(headers map[string][]string) {
 	c.rateLimits.update(headers)
 }
 
+// GetConnectionPoolStats returns current connection pool metrics.
+// Returns nil if metrics are not available (e.g., when using a custom HTTPClient).
+func (c *Client) GetConnectionPoolStats() *ConnectionPoolStats {
+	if c.metrics == nil {
+		return nil
+	}
+	stats := c.metrics.GetStats()
+	return &stats
+}
+
+// LogConnectionPoolStats logs current connection pool statistics.
+// Does nothing if metrics are not available.
+func (c *Client) LogConnectionPoolStats() {
+	if c.metrics != nil {
+		c.metrics.LogStats()
+	}
+}
+
 // defaultHTTPClient wraps standard http.Client to implement client.HTTPClient.
 type defaultHTTPClient struct {
 	client *http.Client
 }
 
-// newDefaultHTTPClient creates a new default HTTP client.
-func newDefaultHTTPClient(timeout time.Duration) client.HTTPClient {
+// newDefaultHTTPClientWithMetrics creates a new default HTTP client with connection pooling and metrics.
+func newDefaultHTTPClientWithMetrics(timeout time.Duration, poolConfig client.ConnectionPoolConfig, metrics *ConnectionPoolMetrics) client.HTTPClient {
+	// Create connection pool configuration
+	transport := &http.Transport{
+		// Connection pool settings from config
+		MaxIdleConns:        poolConfig.MaxIdleConns,
+		MaxIdleConnsPerHost: poolConfig.MaxIdleConnsPerHost,
+		MaxConnsPerHost:     poolConfig.MaxConnsPerHost,
+		IdleConnTimeout:     poolConfig.IdleConnTimeout,
+
+		// Connection timeout settings
+		DisableKeepAlives:   false, // Enable connection reuse
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   poolConfig.EnableHTTP2,
+
+		// Timeouts for establishing connections
+		TLSHandshakeTimeout:   poolConfig.ConnectionTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// Wrap transport with metrics if provided
+	var finalTransport http.RoundTripper = transport
+	if metrics != nil {
+		finalTransport = newMetricsTransport(transport, metrics)
+	}
+
 	return &defaultHTTPClient{
 		client: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   timeout,
+			Transport: finalTransport,
 		},
 	}
 }

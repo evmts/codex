@@ -42,7 +42,9 @@ type ConnectionError struct {
 }
 
 func (e *ConnectionError) Error() string {
-	return fmt.Sprintf("connection failed to %s: %v", e.URL, e.Cause)
+	msg := fmt.Sprintf("connection failed to %s: %v", e.URL, e.Cause)
+	msg += ". Check your network connection and verify the server is accessible"
+	return msg
 }
 
 func (e *ConnectionError) Unwrap() error {
@@ -113,14 +115,24 @@ type UsageLimitError struct {
 }
 
 func (e *UsageLimitError) Error() string {
-	msg := "usage limit reached"
-	if e.PlanType != "" {
-		msg += fmt.Sprintf(" (plan: %s)", e.PlanType)
+	baseMsg := "You've hit your usage limit"
+
+	switch e.PlanType {
+	case "free":
+		return baseMsg + ". Upgrade to Plus to continue using Codex (https://openai.com/chatgpt/pricing)"
+	case "plus":
+		suffix := formatResetSuffix(e.ResetsAt, " or try again")
+		return fmt.Sprintf("%s. Upgrade to Pro (https://openai.com/chatgpt/pricing)%s", baseMsg, suffix)
+	case "team", "business":
+		suffix := formatResetSuffix(e.ResetsAt, " or try again")
+		return fmt.Sprintf("%s. To get more access now, send a request to your admin%s", baseMsg, suffix)
+	case "pro", "enterprise", "edu":
+		suffix := formatResetSuffix(e.ResetsAt, ". Try again")
+		return fmt.Sprintf("%s%s", baseMsg, suffix)
+	default:
+		suffix := formatResetSuffix(e.ResetsAt, ". Try again")
+		return fmt.Sprintf("%s%s", baseMsg, suffix)
 	}
-	if e.ResetsAt != nil {
-		msg += fmt.Sprintf(" (resets at: %v)", e.ResetsAt)
-	}
-	return msg
 }
 
 // ContextWindowExceededError indicates the prompt is too long.
@@ -134,10 +146,11 @@ type ContextWindowExceededError struct {
 }
 
 func (e *ContextWindowExceededError) Error() string {
+	msg := "Codex ran out of room in the model's context window. Start a new conversation or clear earlier history before retrying"
 	if e.TokenCount > 0 && e.MaxTokens > 0 {
-		return fmt.Sprintf("context window exceeded: %d tokens exceeds limit of %d", e.TokenCount, e.MaxTokens)
+		msg = fmt.Sprintf("Context window exceeded: using %d tokens (limit: %d). %s", e.TokenCount, e.MaxTokens, msg)
 	}
-	return "context window exceeded"
+	return msg
 }
 
 // IdleTimeoutError indicates the stream went silent for too long.
@@ -184,9 +197,14 @@ type UnauthorizedError struct {
 }
 
 func (e *UnauthorizedError) Error() string {
-	msg := "unauthorized: " + e.Message
+	msg := "Unauthorized: " + e.Message
 	if e.RequestID != "" {
 		msg += fmt.Sprintf(" (request_id: %s)", e.RequestID)
+	}
+	if e.CanRefresh {
+		msg += ". Authentication token may have expired - attempting to refresh"
+	} else {
+		msg += ". Check your API key or authentication token"
 	}
 	return msg
 }
@@ -265,4 +283,69 @@ func NewUnauthorizedError(message string, canRefresh bool) *UnauthorizedError {
 		Message:    message,
 		CanRefresh: canRefresh,
 	}
+}
+
+// Helper functions for error formatting
+
+// formatResetSuffix formats a reset time into a human-readable suffix
+func formatResetSuffix(resetsAt *time.Time, prefix string) string {
+	if resetsAt == nil {
+		return prefix + " later"
+	}
+
+	remaining := time.Until(*resetsAt)
+	if remaining <= 0 {
+		return prefix + " now"
+	}
+
+	duration := formatDuration(remaining)
+	return prefix + " in " + duration
+}
+
+// formatDuration formats a duration into a human-readable string
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return "less than a minute"
+	}
+
+	totalSecs := int(d.Seconds())
+	days := totalSecs / 86400
+	hours := (totalSecs % 86400) / 3600
+	minutes := (totalSecs % 3600) / 60
+
+	var parts []string
+	if days > 0 {
+		unit := "day"
+		if days > 1 {
+			unit = "days"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", days, unit))
+	}
+	if hours > 0 {
+		unit := "hour"
+		if hours > 1 {
+			unit = "hours"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", hours, unit))
+	}
+	if minutes > 0 {
+		unit := "minute"
+		if minutes > 1 {
+			unit = "minutes"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", minutes, unit))
+	}
+
+	if len(parts) == 0 {
+		return "less than a minute"
+	}
+
+	result := ""
+	for i, part := range parts {
+		if i > 0 {
+			result += " "
+		}
+		result += part
+	}
+	return result
 }
