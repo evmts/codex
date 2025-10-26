@@ -327,13 +327,50 @@ go test ./pkg/sdk -v -run Example
 
 ## Examples
 
-See [example_test.go](./example_test.go) for complete working examples including:
+See [example_test.go](./example_test.go) for complete working examples. All examples are runnable with `go test -v -run Example`.
 
-- Basic request/response
-- Streaming responses
-- Tool approval handling
-- Multiple concurrent sessions
-- History management
+### Basic Usage Examples
+
+- **Example_basicUsage** - Simple question/answer interaction
+- **Example_withStreaming** - Streaming responses with real-time feedback
+- **Example_withHistory** - Multi-turn conversations with context
+- **Example_resumeSession** - Resume conversations from previous sessions
+
+### Configuration Examples
+
+- **Example_customModel** - Using specific models per session
+- **Example_approvalPolicies** - Different tool approval modes (auto, always, never)
+- **Example_sandboxPolicies** - File system access control (read-only, workspace, full)
+- **Example_systemPrompt** - Custom system prompts for specialized assistants
+
+### Tool Usage Examples
+
+- **Example_fileOperations** - File reading and writing operations
+- **Example_shellCommands** - Executing shell commands with approval
+- **Example_multipleTools** - Chaining multiple tools for complex tasks
+
+### Error Handling Examples
+
+- **Example_errorHandling** - Proper error checking and handling patterns
+- **Example_contextCancellation** - Timeout and cancellation handling
+- **Example_approvalDenied** - Handling denied tool operations
+
+### Advanced Features Examples
+
+- **Example_multipleSessionsConcurrent** - Running multiple sessions concurrently
+- **Example_tokenTracking** - Monitoring token usage and costs
+- **Example_customTools** - Extending SDK with custom tools
+
+### Complete Workflow Examples
+
+- **Example_basicWorkflow** - End-to-end basic workflow
+- **Example_multipleSessions** - Managing multiple sessions
+- **Example_toolApproval** - Tool approval callback setup
+- **ExampleNew** - SDK initialization
+- **ExampleSDK_NewSession** - Session creation patterns
+- **ExampleSession_Submit** - Non-streaming message submission
+- **ExampleSession_SubmitStream** - Streaming message submission
+- **ExampleSession_History** - Accessing conversation history
 
 ## License
 

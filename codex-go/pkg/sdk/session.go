@@ -143,6 +143,16 @@ func (s *Session) History() []*Message {
 
 // Submit sends a message and waits for the complete response.
 // This is a blocking call suitable for non-streaming use cases.
+//
+// The method:
+// 1. Validates the message is not empty
+// 2. Creates a protocol.OpUserTurn with the message
+// 3. Submits it to the conversation manager via SubmitOp()
+// 4. Waits for completion events from the manager
+// 5. Extracts the assistant's response and token usage
+// 6. Returns the complete response
+//
+// Context cancellation is respected throughout the process.
 func (s *Session) Submit(ctx context.Context, message string) (*Response, error) {
 	s.mu.Lock()
 	if s.closed {
@@ -155,6 +165,11 @@ func (s *Session) Submit(ctx context.Context, message string) (*Response, error)
 	}
 	s.mu.Unlock()
 
+	// Validate message
+	if message == "" {
+		return nil, fmt.Errorf("message cannot be empty")
+	}
+
 	// Add user message to history
 	userMsg := &Message{
 		Role:    "user",
@@ -162,22 +177,32 @@ func (s *Session) Submit(ctx context.Context, message string) (*Response, error)
 	}
 	s.addMessage(userMsg)
 
-	// For now, return a placeholder response
-	// In full implementation, this would:
-	// 1. Create a turn with the conversation manager
-	// 2. Execute the turn with tool orchestration
-	// 3. Collect the response and tool executions
-	// 4. Add assistant message to history
-	// 5. Return the response
+	// Submit to manager and collect streaming response
+	streamCh, err := s.submitInternal(ctx, message)
+	if err != nil {
+		return nil, err
+	}
 
-	response := &Response{
-		Content:      "This is a placeholder response. Full implementation pending.",
-		FinishReason: "stop",
-		TokenUsage: TokenUsage{
-			InputTokens:  10,
-			OutputTokens: 20,
-			TotalTokens:  30,
-		},
+	// Collect all events and build final response
+	var response Response
+	var contentBuilder string
+
+	for event := range streamCh {
+		if event.Error != nil {
+			return nil, event.Error
+		}
+
+		if event.Delta != "" {
+			contentBuilder += event.Delta
+		}
+
+		if event.Done && event.Response != nil {
+			response = *event.Response
+			// Use accumulated content if response content is empty
+			if response.Content == "" {
+				response.Content = contentBuilder
+			}
+		}
 	}
 
 	// Add assistant message to history
@@ -187,7 +212,7 @@ func (s *Session) Submit(ctx context.Context, message string) (*Response, error)
 	}
 	s.addMessage(assistantMsg)
 
-	return response, nil
+	return &response, nil
 }
 
 // SubmitStream sends a message and returns a channel for streaming responses.
@@ -211,58 +236,8 @@ func (s *Session) SubmitStream(ctx context.Context, message string) (<-chan Stre
 	}
 	s.addMessage(userMsg)
 
-	// Create event channel
-	eventCh := make(chan StreamEvent, 10)
-
-	// Start streaming in background
-	go func() {
-		defer close(eventCh)
-
-		// For now, send a placeholder response
-		// In full implementation, this would stream from the model
-
-		// Send delta events
-		eventCh <- StreamEvent{
-			Type:  "delta",
-			Delta: "This is ",
-		}
-
-		eventCh <- StreamEvent{
-			Type:  "delta",
-			Delta: "a placeholder ",
-		}
-
-		eventCh <- StreamEvent{
-			Type:  "delta",
-			Delta: "streaming response.",
-		}
-
-		// Send final event
-		response := &Response{
-			Content:      "This is a placeholder streaming response.",
-			FinishReason: "stop",
-			TokenUsage: TokenUsage{
-				InputTokens:  10,
-				OutputTokens: 20,
-				TotalTokens:  30,
-			},
-		}
-
-		eventCh <- StreamEvent{
-			Type:     "done",
-			Done:     true,
-			Response: response,
-		}
-
-		// Add assistant message to history
-		assistantMsg := &Message{
-			Role:    "assistant",
-			Content: response.Content,
-		}
-		s.addMessage(assistantMsg)
-	}()
-
-	return eventCh, nil
+	// Use shared internal implementation
+	return s.submitInternal(ctx, message)
 }
 
 // close closes the session and releases resources.
