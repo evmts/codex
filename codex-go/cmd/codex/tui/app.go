@@ -3,11 +3,13 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/evmts/codex/codex-go/internal/conversation/manager"
+	"github.com/evmts/codex/codex-go/internal/input"
 	"github.com/evmts/codex/codex-go/internal/protocol"
 )
 
@@ -110,8 +112,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.waitForEvent() // Continue polling
 
 	case textDeltaMsg:
-		// Append streaming text delta
-		m.streamingText += msg.delta
+		// Sanitize and append streaming text delta to prevent ANSI injection
+		sanitizedDelta := SanitizeContent(msg.delta)
+		m.streamingText += sanitizedDelta
 		return m, m.waitForEvent() // Continue polling
 
 	case reasoningDeltaMsg:
@@ -143,7 +146,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Task complete - finalize the message
 		finalText := m.streamingText
 		if finalText == "" && msg.finalMessage != "" {
-			finalText = msg.finalMessage
+			finalText = SanitizeContent(msg.finalMessage)
 		}
 		if finalText != "" {
 			m.messages = append(m.messages, Message{
@@ -216,7 +219,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case streamingMsg:
-		m.streamingText += msg.text
+		// Sanitize legacy streaming text to prevent ANSI injection
+		m.streamingText += SanitizeContent(msg.text)
 		return m, waitForStreaming(msg.done)
 
 	case streamingDoneMsg:
@@ -328,13 +332,20 @@ func (m *Model) createNewSession() tea.Cmd {
 			return nil
 		}
 
+		// Get absolute path for current directory
+		// Tools require absolute paths for working directory
+		cwd, err := os.Getwd()
+		if err != nil {
+			cwd = "." // Fallback to relative path
+		}
+
 		// Create session
 		ctx := context.Background()
-		_, err := m.conversationMgr.CreateSession(ctx, manager.SessionConfig{
+		_, err = m.conversationMgr.CreateSession(ctx, manager.SessionConfig{
 			ID:     sessionID,
 			Client: nil, // Uses manager's default client
 			TurnContext: &manager.TurnContext{
-				Cwd:            ".",
+				Cwd:            cwd,
 				ApprovalPolicy: "auto",
 				SandboxPolicy:  protocol.SandboxPolicy{Mode: "native"},
 				Model:          m.model,
@@ -385,19 +396,50 @@ func (m *Model) submitMessage() tea.Cmd {
 	m.inputText.Blur()
 
 	return func() tea.Msg {
-		// Submit to conversation manager
+		// Parse @ file references from user input
 		ctx := context.Background()
-		textPtr := &userInput
-		op := &protocol.OpUserInput{
-			Items: []protocol.UserInput{
-				{
-					Type: "text",
-					Text: textPtr,
-				},
-			},
+		workingDir, _ := os.Getwd()
+		parseResult, err := input.ParseFileReferences(userInput, workingDir)
+		if err != nil {
+			return errorMsg{err: fmt.Errorf("failed to parse file references: %w", err)}
 		}
 
-		err := m.conversationMgr.SubmitOp(ctx, m.getCurrentSessionID(), op)
+		// Build UserInput items
+		items := []protocol.UserInput{}
+
+		// Add processed text (with @ references replaced by placeholders)
+		if parseResult.ProcessedText != "" {
+			textPtr := &parseResult.ProcessedText
+			items = append(items, protocol.UserInput{
+				Type: protocol.UserInputTypeText,
+				Text: textPtr,
+			})
+		}
+
+		// Add file references
+		for _, ref := range parseResult.FileReferences {
+			pathPtr := &ref.Path
+			items = append(items, protocol.UserInput{
+				Type: protocol.UserInputTypePath,
+				Path: pathPtr,
+			})
+		}
+
+		// If no items were created (empty input), add the original text
+		if len(items) == 0 {
+			textPtr := &userInput
+			items = append(items, protocol.UserInput{
+				Type: protocol.UserInputTypeText,
+				Text: textPtr,
+			})
+		}
+
+		// Submit to conversation manager
+		op := &protocol.OpUserInput{
+			Items: items,
+		}
+
+		err = m.conversationMgr.SubmitOp(ctx, m.getCurrentSessionID(), op)
 		if err != nil {
 			return errorMsg{err: err}
 		}

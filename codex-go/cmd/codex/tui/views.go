@@ -124,13 +124,17 @@ func RenderConversation(sessionID string, messages []Message, streamingText stri
 			prefix = fmt.Sprintf("%s: ", msg.Role)
 		}
 
-		b.WriteString(style.Render(prefix + msg.Content))
+		// Sanitize content to prevent ANSI escape sequence injection attacks
+		sanitizedContent := SanitizeContent(msg.Content)
+		b.WriteString(style.Render(prefix + sanitizedContent))
 		b.WriteString("\n\n")
 	}
 
 	// Render streaming text if present
 	if streamingText != "" {
-		b.WriteString(streamingStyle.Render("Assistant: " + streamingText))
+		// Sanitize streaming text to prevent ANSI escape sequence injection attacks
+		sanitizedStreamingText := SanitizeContent(streamingText)
+		b.WriteString(streamingStyle.Render("Assistant: " + sanitizedStreamingText))
 		b.WriteString(" ▌") // Cursor
 		b.WriteString("\n\n")
 	}
@@ -147,12 +151,16 @@ func RenderToolApproval(toolName string, toolParams map[string]interface{}, risk
 	var b strings.Builder
 
 	b.WriteString("Tool Approval Required\n\n")
-	b.WriteString(fmt.Sprintf("Tool: %s\n", toolName))
-	b.WriteString(fmt.Sprintf("Risk Level: %s\n\n", riskLevel))
+	// Sanitize tool name and risk level to prevent injection
+	b.WriteString(fmt.Sprintf("Tool: %s\n", SanitizeContent(toolName)))
+	b.WriteString(fmt.Sprintf("Risk Level: %s\n\n", SanitizeContent(riskLevel)))
 	b.WriteString("Parameters:\n")
 
 	for key, value := range toolParams {
-		b.WriteString(fmt.Sprintf("  %s: %v\n", key, value))
+		// Sanitize both key and value to prevent injection
+		sanitizedKey := SanitizeContent(key)
+		sanitizedValue := SanitizeContent(fmt.Sprintf("%v", value))
+		b.WriteString(fmt.Sprintf("  %s: %s\n", sanitizedKey, sanitizedValue))
 	}
 
 	b.WriteString("\n")
